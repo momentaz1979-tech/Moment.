@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Office Assistant</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="app">
+  <aside class="sidebar">
+    <h2>টেমপ্লেট সমূহ</h2>
+    <ul id="template-list" class="template-list"></ul>
+    <div class="sidebar-buttons">
+      <button id="btn-new-template">নতুন</button>
+      <button id="btn-edit-template">সম্পাদনা</button>
+      <button id="btn-delete-template">মুছুন</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="command-row">
+      <input id="command-input" type="text"
+             placeholder="এখানে টাইপ করুন অথবা মাইক বোতাম চেপে ধরে বলুন — যেমন: নোটিশ তৈরি করো বিষয় ... তারিখ ..." />
+      <button id="talk-button" class="talk-button">🎤 চেপে ধরে বলুন</button>
+    </div>
+    <p id="voice-status" class="voice-status"></p>
+
+    <h3>নির্বাচিত টেমপ্লেটের তথ্য পূরণ করুন:</h3>
+    <form id="fields-form" class="fields-form"></form>
+
+    <label for="title-input">ফাইলের শিরোনাম:</label>
+    <input id="title-input" type="text" placeholder="যেমন: ট্রেনিং নোটিশ ২৭-০৭-২০২৬" />
+
+    <button id="btn-generate" class="generate-button">ডকুমেন্ট তৈরি করো (Word)</button>
+
+    <h3>সাম্প্রতিক তৈরি করা ডকুমেন্ট</h3>
+    <ul id="history-list" class="history-list"></ul>
+  </main>
+</div>
+
+<dialog id="template-dialog">
+  <form id="template-form" method="dialog">
+    <h3 id="template-dialog-title">নতুন টেমপ্লেট</h3>
+    <label>নাম:<br><input id="template-name" type="text" required></label><br><br>
+    <label>ধরন:<br>
+      <select id="template-category">
+        <option>নোটিশ</option>
+        <option>অফিস আদেশ</option>
+        <option>স্মারক</option>
+        <option>প্রতিবেদন</option>
+      </select>
+    </label><br><br>
+    <label>টেমপ্লেট লেখা (পরিবর্তনযোগ্য জায়গায় {ফিল্ডের_নাম} ব্যবহার করুন):<br>
+      <textarea id="template-body" rows="10" required
+        placeholder="বিষয়: {বিষয়}&#10;&#10;জনাব,&#10;{বার্তা}&#10;&#10;তারিখ: {তারিখ}"></textarea>
+    </label><br><br>
+    <div class="dialog-buttons">
+      <button type="button" id="template-cancel">বাতিল</button>
+      <button type="submit" id="template-save">সংরক্ষণ করুন</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
