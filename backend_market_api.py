@@ -12,6 +12,7 @@ StockPilot BD AI — Market Module Backend (FastAPI)
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from datetime import date, timedelta
 import random
 
@@ -234,4 +235,204 @@ def remove_watchlist(trading_code: str):
 
 @app.get("/")
 def root():
-    return {"message": "StockPilot BD AI Market API চলছে। /docs এ যান বিস্তারিত দেখতে।"}
+    return {"message": "StockPilot BD AI Market API চলছে। /app এ যান লাইভ ড্যাশবোর্ড দেখতে, অথবা /docs এ API বিস্তারিত দেখতে।"}
+
+
+# ---------------------------------------------------------------
+# লাইভ ড্যাশবোর্ড (same-origin — কোনো CORS/sandbox সমস্যা ছাড়াই ব্রাউজারে সরাসরি খোলা যায়)
+# ---------------------------------------------------------------
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StockPilot BD AI — Market</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+Bengali:wght@600;700&family=Hind+Siliguri:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+  * { box-sizing: border-box; font-family: 'Hind Siliguri','Inter',system-ui,sans-serif; }
+  body { margin:0; min-height:100vh; background:#12151A; color:#EDEFF2; padding:28px 20px 60px; }
+  .wrap { max-width:880px; margin:0 auto; }
+  .top { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:16px; }
+  .eyebrow { font-size:12px; color:#7D8590; letter-spacing:.1em; font-family:'IBM Plex Mono',monospace; }
+  h1 { font-size:26px; font-weight:700; font-family:'Noto Serif Bengali',serif; margin:2px 0 0; }
+  .refresh { background:#1C2028; border:1px solid #262B33; border-radius:8px; padding:8px 14px; color:#C4C9D1; font-size:12.5px; cursor:pointer; }
+  .banner { padding:10px 14px; border-radius:8px; font-size:12.5px; margin-bottom:18px; }
+  .banner.live { background:#153D2B; color:#3EC98B; }
+  .banner.loading { background:#1C2028; color:#9199A3; }
+  .banner.error { background:#3A1E1E; color:#F0A18F; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .retry { background:#F0654A; color:#fff; border:none; border-radius:6px; padding:6px 12px; font-size:12px; font-weight:600; cursor:pointer; }
+  .hero { background:linear-gradient(135deg,#171B22 0%,#1B2129 100%); border:1px solid #262B33; border-radius:16px; padding:24px 26px; margin-bottom:28px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px; min-height:120px; }
+  .hero-name { font-size:13px; color:#7D8590; margin-bottom:4px; }
+  .hero-value { font-size:40px; font-weight:700; font-family:'IBM Plex Mono',monospace; letter-spacing:-.02em; }
+  .up { color:#3EC98B; font-weight:600; }
+  .down { color:#F0654A; font-weight:600; }
+  .stat { color:#7D8590; font-size:13px; }
+  .stat b { display:block; color:#EDEFF2; font-family:'IBM Plex Mono',monospace; font-size:16px; margin-top:2px; font-weight:500; }
+  .section-eyebrow { font-size:11px; letter-spacing:.14em; color:#7D8590; text-transform:uppercase; font-family:'IBM Plex Mono',monospace; }
+  .section-title { font-size:20px; font-weight:700; color:#EDEFF2; font-family:'Noto Serif Bengali',serif; margin-bottom:14px; }
+  .heatgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px; margin-bottom:34px; min-height:90px; }
+  .heatcell { border:1px solid rgba(255,255,255,.06); border-radius:10px; padding:14px 12px; }
+  .heatcell .name { font-size:12.5px; font-weight:600; margin-bottom:8px; color:#F2F4F7; }
+  .heatcell .pct { font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:600; }
+  .heatcell .meta { font-size:10.5px; color:#D8DBE0; margin-top:4px; }
+  .tabs { display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; }
+  .tab-btn { background:#1C2028; color:#C4C9D1; border:1px solid #262B33; border-radius:8px; padding:8px 14px; font-size:13px; font-weight:600; cursor:pointer; }
+  .tab-btn.active { background:#3EC98B; color:#0C1210; border-color:#3EC98B; }
+  .search { margin-left:auto; background:#1C2028; border:1px solid #262B33; border-radius:8px; padding:8px 12px; color:#EDEFF2; font-size:13px; outline:none; width:160px; }
+  table { width:100%; border-collapse:collapse; border:1px solid #262B33; border-radius:12px; overflow:hidden; }
+  thead td { padding:10px 16px; font-size:11px; color:#7D8590; letter-spacing:.05em; border-bottom:1px solid #262B33; background:#171B22; }
+  tbody td { padding:12px 16px; font-size:13.5px; border-bottom:1px solid #1D222A; }
+  tbody tr:hover { background:#1C2028; }
+  .code { font-family:'IBM Plex Mono',monospace; font-weight:600; color:#8FB8FF; }
+  .num { font-family:'IBM Plex Mono',monospace; text-align:right; }
+  .muted { color:#9199A3; }
+  .right { text-align:right; }
+  .footer { margin-top:30px; font-size:11.5px; color:#5B6270; text-align:center; }
+  .empty { padding:24px; text-align:center; color:#7D8590; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div class="eyebrow">STOCKPILOT BD AI · MARKET (LIVE)</div>
+      <h1>বাজার সংক্ষিপ্ত বিবরণ</h1>
+    </div>
+    <button class="refresh" onclick="loadAll()">↻ রিফ্রেশ</button>
+  </div>
+  <div id="banner" class="banner loading">⏳ সার্ভার থেকে লাইভ ডেটা লোড হচ্ছে...</div>
+
+  <div class="hero" id="hero">
+    <div style="color:#5B6270; font-size:13px;">ইনডেক্স ডেটা লোড হচ্ছে...</div>
+  </div>
+
+  <div class="section-eyebrow">Sector Heatmap</div>
+  <div class="section-title">সেক্টর ভিত্তিক পারফরম্যান্স</div>
+  <div class="heatgrid" id="heatgrid"></div>
+
+  <div class="section-eyebrow">Market Movers</div>
+  <div class="section-title">শীর্ষ পরিবর্তনসমূহ</div>
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="gainers" onclick="setTab('gainers')">টপ গেইনার্স</button>
+    <button class="tab-btn" data-tab="losers" onclick="setTab('losers')">টপ লুজার্স</button>
+    <button class="tab-btn" data-tab="volume" onclick="setTab('volume')">ভলিউম লিডার্স</button>
+    <input class="search" id="search" placeholder="কোম্পানি খুঁজুন..." oninput="renderTable()">
+  </div>
+  <table>
+    <thead><tr><td>কোড</td><td>কোম্পানি</td><td class="right">এলটিপি</td><td class="right">পরিবর্তন</td><td class="right">ভলিউম</td></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <div class="footer">সংযুক্ত: এই সার্ভার (same-origin) — লাইভ ডেটা।</div>
+</div>
+
+<script>
+let DATA = { gainers: [], losers: [], volume: [] };
+let TAB = 'gainers';
+
+function fmt(n) { return new Intl.NumberFormat('en-US').format(n); }
+function fmtBDT(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(2) + ' বিলিয়ন';
+  if (n >= 1e7) return (n/1e7).toFixed(2) + ' কোটি';
+  return fmt(n);
+}
+function pillHTML(v) {
+  const cls = v >= 0 ? 'up' : 'down';
+  const arrow = v >= 0 ? '▲' : '▼';
+  return `<span class="${cls}">${arrow} ${Math.abs(v).toFixed(2)}%</span>`;
+}
+
+async function loadAll() {
+  const banner = document.getElementById('banner');
+  banner.className = 'banner loading';
+  banner.innerHTML = '⏳ সার্ভার থেকে লাইভ ডেটা লোড হচ্ছে...';
+  try {
+    const [idxRes, gainRes, loseRes, volRes, secRes] = await Promise.all([
+      fetch('/v1/market/index/DSEX'),
+      fetch('/v1/market/gainers?limit=6'),
+      fetch('/v1/market/losers?limit=6'),
+      fetch('/v1/market/volume-leaders?limit=6'),
+      fetch('/v1/market/sector-heatmap'),
+    ]);
+    if (!idxRes.ok || !gainRes.ok || !loseRes.ok || !volRes.ok || !secRes.ok) throw new Error('bad response');
+    const [idx, gain, lose, vol, sec] = await Promise.all([idxRes.json(), gainRes.json(), loseRes.json(), volRes.json(), secRes.json()]);
+
+    renderHero(idx);
+    renderHeat(sec.sectors || []);
+    DATA.gainers = gain.data || [];
+    DATA.losers = lose.data || [];
+    DATA.volume = vol.data || [];
+    renderTable();
+
+    banner.className = 'banner live';
+    banner.innerHTML = '● লাইভ — সার্ভার থেকে সরাসরি ডেটা আসছে';
+  } catch (e) {
+    banner.className = 'banner error';
+    banner.innerHTML = '⚠️ সার্ভারের সাথে সংযোগ করা যায়নি। একটু পর আবার চেষ্টা করুন। <button class="retry" onclick="loadAll()">আবার চেষ্টা করুন</button>';
+  }
+}
+
+function renderHero(idx) {
+  document.getElementById('hero').innerHTML = `
+    <div>
+      <div class="hero-name">${idx.index_name}</div>
+      <div class="hero-value">${fmt(idx.close_value)}</div>
+      <div style="margin-top:6px; font-size:15px;">${pillHTML(idx.change_percent)} <span style="color:#7D8590; margin-left:6px;">(${idx.change_value > 0 ? '+' : ''}${idx.change_value})</span></div>
+    </div>
+    <div style="display:flex; gap:28px;">
+      <div class="stat">মোট ভলিউম<b>${fmt(idx.total_volume)}</b></div>
+      <div class="stat">মোট টার্নওভার<b>৳ ${fmtBDT(idx.total_turnover)}</b></div>
+    </div>
+  `;
+}
+
+function renderHeat(sectors) {
+  const grid = document.getElementById('heatgrid');
+  grid.innerHTML = sectors.map(s => {
+    const clamp = Math.max(-8, Math.min(8, s.avg_change_pct));
+    const color = clamp >= 0
+      ? `rgba(62,201,139,${0.15 + (clamp/8)*0.65})`
+      : `rgba(240,101,74,${0.15 + (Math.abs(clamp)/8)*0.65})`;
+    return `<div class="heatcell" style="background:${color}">
+      <div class="name">${s.sector_name}</div>
+      <div class="pct">${s.avg_change_pct >= 0 ? '+' : ''}${s.avg_change_pct}%</div>
+      <div class="meta">${s.advancers} বৃদ্ধি · ${s.decliners} পতন</div>
+    </div>`;
+  }).join('');
+}
+
+function setTab(t) {
+  TAB = t;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
+  renderTable();
+}
+
+function renderTable() {
+  const q = document.getElementById('search').value.trim().toLowerCase();
+  let rows = DATA[TAB] || [];
+  if (q) rows = rows.filter(r => r.trading_code.toLowerCase().includes(q) || r.company_name.toLowerCase().includes(q));
+  const tbody = document.getElementById('tbody');
+  if (rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">কোনো ফলাফল পাওয়া যায়নি।</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td class="code">${r.trading_code}</td>
+      <td>${r.company_name}</td>
+      <td class="num">৳${r.ltp}</td>
+      <td class="right">${pillHTML(r.change_percent)}</td>
+      <td class="num muted">${fmt(r.volume)}</td>
+    </tr>
+  `).join('');
+}
+
+loadAll();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/app", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD_HTML
