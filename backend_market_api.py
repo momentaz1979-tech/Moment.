@@ -11,10 +11,19 @@ StockPilot BD AI — Market Module Backend (FastAPI)
 """
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import date, timedelta
 import random
 
 app = FastAPI(title="StockPilot BD AI — Market API", version="1.0.0")
+
+# UI (Claude আর্টিফ্যাক্ট / ব্রাউজার) থেকে ভিন্ন origin থেকে API কল করার অনুমতি
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------
 # মক ডেটা (ডেমো/টেস্টিং-এর জন্য; বাস্তব ডেটাবেস দিয়ে প্রতিস্থাপন করুন)
