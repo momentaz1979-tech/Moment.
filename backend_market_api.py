@@ -10,13 +10,19 @@ StockPilot BD AI — Market Module Backend (FastAPI)
 ডেটা আসবে (SQLAlchemy/asyncpg দিয়ে PostgreSQL-এর সাথে সংযোগ করে)।
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from datetime import date, timedelta
 import random
+import os
 
 app = FastAPI(title="StockPilot BD AI — Market API", version="1.0.0")
+
+# Admin ডেটা এন্ট্রি সুরক্ষার জন্য কী (Railway Variables-এ ADMIN_KEY সেট করুন;
+# না করলে ডিফল্ট মান ব্যবহার হবে, যা প্রোডাকশনে নিরাপদ নয়)
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme123")
 
 # UI (Claude আর্টিফ্যাক্ট / ব্রাউজার) থেকে ভিন্ন origin থেকে API কল করার অনুমতি
 app.add_middleware(
@@ -79,6 +85,21 @@ DEMO_DISCLAIMER = {
     "disclaimer_bn": "⚠️ এটি ডেমো/মক ডেটা, প্রকৃত DSE ডেটা নয়। বিনিয়োগ সিদ্ধান্তের জন্য ব্যবহার করবেন না — dsebd.org বা আপনার ব্রোকারের অফিসিয়াল তথ্য দেখুন।",
 }
 
+VERIFIED_DISCLAIMER = {
+    "is_demo_data": False,
+    "disclaimer_bn": "✅ dsebd.org থেকে ম্যানুয়ালি যাচাই করে দেওয়া বাস্তব ডেটা। তবুও বড় সিদ্ধান্তের আগে সরাসরি dsebd.org-এ ক্রস-চেক করার পরামর্শ দেওয়া হচ্ছে।",
+}
+
+# ---------------------------------------------------------------
+# Manual Data Entry স্টোর (in-memory) — তারিখ অনুযায়ী ম্যানুয়ালি
+# যাচাই করা প্রকৃত DSEX/গেইনার্স/লুজার্স ডেটা রাখা হয়
+# ---------------------------------------------------------------
+_MANUAL_DATA: dict[str, dict] = {}  # date isoformat -> {"index": {...}, "gainers": [...], "losers": [...]}
+
+
+def _today_manual():
+    return _MANUAL_DATA.get(date.today().isoformat())
+
 
 # ---------------------------------------------------------------
 # ১. Market Index
@@ -89,6 +110,11 @@ def get_index(index_name: str, from_date: date | None = None, to_date: date | No
     if index_name not in ("DSEX", "DS30", "DSES"):
         raise HTTPException(400, "অবৈধ ইনডেক্স নাম। DSEX, DS30, অথবা DSES ব্যবহার করুন।")
     today = to_date or date.today()
+
+    manual = _MANUAL_DATA.get(today.isoformat())
+    if manual and manual.get("index") and index_name == "DSEX":
+        return {**manual["index"], "index_name": "DSEX", "trade_date": today.isoformat(), **VERIFIED_DISCLAIMER}
+
     rnd = random.Random(f"{index_name}-{today.isoformat()}")
     close = round(rnd.uniform(4500, 6800), 2)
     change = round(rnd.uniform(-80, 80), 2)
@@ -114,12 +140,18 @@ def _all_prices(d: date):
 
 @app.get("/v1/market/gainers")
 def get_gainers(target_date: date = Query(default_factory=date.today), limit: int = 20):
+    manual = _MANUAL_DATA.get(target_date.isoformat())
+    if manual and manual.get("gainers"):
+        return {"trade_date": target_date.isoformat(), "data": manual["gainers"][:limit], **VERIFIED_DISCLAIMER}
     rows = sorted(_all_prices(target_date), key=lambda r: r["change_percent"], reverse=True)
     return {"trade_date": target_date.isoformat(), "data": rows[:limit], **DEMO_DISCLAIMER}
 
 
 @app.get("/v1/market/losers")
 def get_losers(target_date: date = Query(default_factory=date.today), limit: int = 20):
+    manual = _MANUAL_DATA.get(target_date.isoformat())
+    if manual and manual.get("losers"):
+        return {"trade_date": target_date.isoformat(), "data": manual["losers"][:limit], **VERIFIED_DISCLAIMER}
     rows = sorted(_all_prices(target_date), key=lambda r: r["change_percent"])
     return {"trade_date": target_date.isoformat(), "data": rows[:limit], **DEMO_DISCLAIMER}
 
@@ -341,9 +373,6 @@ def remove_watchlist(trading_code: str):
 # এটি আপনার প্রকৃত ব্রোকারেজ অ্যাকাউন্টের সাথে সংযুক্ত নয়,
 # এবং এখানকার P&L প্রকৃত বাজার মূল্যের প্রতিফলন নয়।
 # ---------------------------------------------------------------
-from pydantic import BaseModel
-
-
 class HoldingIn(BaseModel):
     trading_code: str
     quantity: int
@@ -408,6 +437,67 @@ def portfolio_summary():
     }
 
 
+# ---------------------------------------------------------------
+# Admin Manual Data Entry মডিউল
+# dsebd.org ব্রাউজ করে (মানুষ হিসেবে, বৈধভাবে) দেখা প্রকৃত ডেটা
+# এখানে দিলে সেটাই "যাচাইকৃত বাস্তব ডেটা" হিসেবে অ্যাপে দেখানো হয়।
+# X-Admin-Key হেডার দিয়ে সুরক্ষিত।
+# ---------------------------------------------------------------
+class ManualMoverIn(BaseModel):
+    trading_code: str
+    company_name: str
+    ltp: float
+    change_percent: float
+    volume: int = 0
+
+
+class ManualIndexIn(BaseModel):
+    close_value: float
+    change_value: float
+    change_percent: float
+    total_volume: int = 0
+    total_turnover: float = 0
+
+
+class ManualEntryIn(BaseModel):
+    index: ManualIndexIn | None = None
+    gainers: list[ManualMoverIn] = []
+    losers: list[ManualMoverIn] = []
+
+
+def _check_admin(x_admin_key: str | None):
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(401, "ভুল Admin Key")
+
+
+@app.post("/v1/admin/manual-entry")
+def submit_manual_entry(entry: ManualEntryIn, x_admin_key: str | None = Header(default=None)):
+    _check_admin(x_admin_key)
+    today_key = date.today().isoformat()
+    existing = _MANUAL_DATA.get(today_key, {})
+    if entry.index:
+        existing["index"] = entry.index.model_dump()
+    if entry.gainers:
+        existing["gainers"] = [g.model_dump() for g in entry.gainers]
+    if entry.losers:
+        existing["losers"] = [l.model_dump() for l in entry.losers]
+    _MANUAL_DATA[today_key] = existing
+    return {"message_bn": f"{today_key}-এর জন্য যাচাইকৃত ডেটা সেভ করা হয়েছে", "saved": existing}
+
+
+@app.get("/v1/admin/manual-entry/today")
+def get_today_manual_entry(x_admin_key: str | None = Header(default=None)):
+    _check_admin(x_admin_key)
+    return _MANUAL_DATA.get(date.today().isoformat(), {"index": None, "gainers": [], "losers": []})
+
+
+@app.delete("/v1/admin/manual-entry/today")
+def clear_today_manual_entry(x_admin_key: str | None = Header(default=None)):
+    _check_admin(x_admin_key)
+    _MANUAL_DATA.pop(date.today().isoformat(), None)
+    return {"message_bn": "আজকের যাচাইকৃত ডেটা মুছে ফেলা হয়েছে, ডেমো ডেটায় ফিরে যাওয়া হয়েছে"}
+
+
 @app.get("/")
 def root():
     return {"message": "StockPilot BD AI Market API চলছে। /app এ যান লাইভ ড্যাশবোর্ড দেখতে, অথবা /docs এ API বিস্তারিত দেখতে।"}
@@ -428,6 +518,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   body { margin:0; min-height:100vh; background:#12151A; color:#EDEFF2; padding:0 0 60px; }
   .wrap { max-width:880px; margin:0 auto; padding:20px 20px 0; }
   .demo-banner { background:#4A1414; color:#FFB4A8; text-align:center; padding:10px 16px; font-size:13px; font-weight:600; border-bottom:2px solid #F0654A; }
+  .demo-banner.verified { background:#153D2B; color:#8CE6B8; border-bottom-color:#3EC98B; }
   .top { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:16px; }
   .eyebrow { font-size:12px; color:#7D8590; letter-spacing:.1em; font-family:'IBM Plex Mono',monospace; }
   h1 { font-size:26px; font-weight:700; font-family:'Noto Serif Bengali',serif; margin:2px 0 0; }
@@ -491,7 +582,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div class="demo-banner">⚠️ এটি DEMO/MOCK ডেটা — প্রকৃত DSE ডেটা নয়। বিনিয়োগ সিদ্ধান্তে ব্যবহার করবেন না।</div>
+<div class="demo-banner" id="topDemoBanner">⚠️ এটি DEMO/MOCK ডেটা — প্রকৃত DSE ডেটা নয়। বিনিয়োগ সিদ্ধান্তে ব্যবহার করবেন না।</div>
 <div class="wrap">
   <div class="top">
     <div>
@@ -505,6 +596,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button class="nav-btn active" data-view="market" onclick="setView('market')">মার্কেট</button>
     <button class="nav-btn" data-view="company" onclick="setView('company')">কোম্পানি ডিটেইল</button>
     <button class="nav-btn" data-view="portfolio" onclick="setView('portfolio')">পোর্টফোলিও</button>
+    <button class="nav-btn" data-view="admin" onclick="setView('admin')">⚙️ Admin</button>
   </div>
 
   <!-- ============ MARKET VIEW ============ -->
@@ -556,6 +648,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="portfolioResult"></div>
   </div>
 
+  <!-- ============ ADMIN VIEW (Manual Data Entry) ============ -->
+  <div class="view" id="view-admin">
+    <div class="card">
+      <div class="section-title" style="font-size:16px; margin-bottom:6px;">আজকের যাচাইকৃত ডেটা যোগ করুন</div>
+      <div class="muted" style="font-size:12.5px; margin-bottom:16px;">dsebd.org-এ ব্রাউজার দিয়ে গিয়ে (মানুষ হিসেবে) দেখা সংখ্যা এখানে লিখুন। সেভ করলে এটাই আজকের "যাচাইকৃত বাস্তব ডেটা" হিসেবে দেখানো হবে।</div>
+      <div class="form-row" style="grid-template-columns:1fr;">
+        <div><label>Admin Key</label><input id="adminKey" type="password" placeholder="Railway-তে সেট করা ADMIN_KEY দিন"></div>
+      </div>
+
+      <div class="section-title" style="font-size:15px; margin:18px 0 10px;">DSEX ইনডেক্স</div>
+      <div class="grid3" style="margin-bottom:16px;">
+        <div><label style="font-size:11px; color:#7D8590;">ক্লোজিং ভ্যালু</label><input id="admClose" type="number" step="0.01" placeholder="5300.50"></div>
+        <div><label style="font-size:11px; color:#7D8590;">পরিবর্তন (পয়েন্ট)</label><input id="admChange" type="number" step="0.01" placeholder="20.10"></div>
+        <div><label style="font-size:11px; color:#7D8590;">পরিবর্তন (%)</label><input id="admChangePct" type="number" step="0.01" placeholder="0.38"></div>
+        <div><label style="font-size:11px; color:#7D8590;">মোট ভলিউম</label><input id="admVolume" type="number" placeholder="123456789"></div>
+        <div><label style="font-size:11px; color:#7D8590;">মোট টার্নওভার (৳)</label><input id="admTurnover" type="number" placeholder="9999999999"></div>
+      </div>
+
+      <div class="section-title" style="font-size:15px; margin:18px 0 6px;">টপ গেইনার্স / লুজার্স (ঐচ্ছিক)</div>
+      <div class="muted" style="font-size:11.5px; margin-bottom:8px;">প্রতি লাইনে একটা করে, কমা দিয়ে ভাগ করা: কোড,কোম্পানির নাম,LTP,পরিবর্তন%,ভলিউম</div>
+      <div class="grid2">
+        <div>
+          <label style="font-size:11px; color:#7D8590;">গেইনার্স</label>
+          <textarea id="admGainers" rows="4" style="width:100%; background:#1C2028; border:1px solid #262B33; border-radius:8px; padding:8px; color:#EDEFF2; font-size:12px; font-family:'IBM Plex Mono',monospace;" placeholder="GP,Grameenphone,310.5,5.2,10000"></textarea>
+        </div>
+        <div>
+          <label style="font-size:11px; color:#7D8590;">লুজার্স</label>
+          <textarea id="admLosers" rows="4" style="width:100%; background:#1C2028; border:1px solid #262B33; border-radius:8px; padding:8px; color:#EDEFF2; font-size:12px; font-family:'IBM Plex Mono',monospace;" placeholder="BEXIMCO,Beximco Limited,80.1,-3.1,5000"></textarea>
+        </div>
+      </div>
+
+      <div style="margin-top:16px; display:flex; gap:10px;">
+        <button class="btn-primary" onclick="submitManualEntry()">সেভ করুন</button>
+        <button class="del-btn" onclick="clearManualEntry()">আজকের এন্ট্রি মুছুন (ডেমোতে ফিরুন)</button>
+      </div>
+      <div id="adminMsg" style="margin-top:14px; font-size:13px;"></div>
+    </div>
+  </div>
+
   <div class="footer">সংযুক্ত: এই সার্ভার (same-origin) — লাইভ ডেটা (ডেমো)।</div>
 </div>
 
@@ -576,7 +707,7 @@ function pillHTML(v) {
   return `<span class="${cls}">${arrow} ${Math.abs(v).toFixed(2)}%</span>`;
 }
 
-const TITLES = { market: 'বাজার সংক্ষিপ্ত বিবরণ', company: 'কোম্পানি ডিটেইল', portfolio: 'পোর্টফোলিও (ডেমো)' };
+const TITLES = { market: 'বাজার সংক্ষিপ্ত বিবরণ', company: 'কোম্পানি ডিটেইল', portfolio: 'পোর্টফোলিও (ডেমো)', admin: 'Admin — ম্যানুয়াল ডেটা এন্ট্রি' };
 
 function setView(v) {
   VIEW = v;
@@ -590,6 +721,18 @@ function refreshCurrent() {
   if (VIEW === 'market') loadAll();
   else if (VIEW === 'company') { if (document.getElementById('companyCode').value.trim()) loadCompany(); }
   else if (VIEW === 'portfolio') loadPortfolio();
+}
+
+function updateTopBanner(isDemo) {
+  const bar = document.getElementById('topDemoBanner');
+  if (!bar) return;
+  if (isDemo) {
+    bar.className = 'demo-banner';
+    bar.textContent = '⚠️ এটি DEMO/MOCK ডেটা — প্রকৃত DSE ডেটা নয়। বিনিয়োগ সিদ্ধান্তে ব্যবহার করবেন না।';
+  } else {
+    bar.className = 'demo-banner verified';
+    bar.textContent = '✅ আজকের ডেটা dsebd.org থেকে ম্যানুয়ালি যাচাই করা — তবুও বড় সিদ্ধান্তের আগে সরাসরি ক্রস-চেক করুন।';
+  }
 }
 
 /* ---------------- MARKET ---------------- */
@@ -615,8 +758,14 @@ async function loadAll() {
     DATA.volume = vol.data || [];
     renderTable();
 
-    banner.className = 'banner live';
-    banner.innerHTML = '● লাইভ (ডেমো ডেটা) — সার্ভার থেকে সরাসরি আসছে';
+    updateTopBanner(idx.is_demo_data);
+    if (idx.is_demo_data) {
+      banner.className = 'banner live';
+      banner.innerHTML = '● লাইভ (ডেমো ডেটা) — সার্ভার থেকে সরাসরি আসছে';
+    } else {
+      banner.className = 'banner live';
+      banner.innerHTML = '✅ লাইভ (যাচাইকৃত বাস্তব ডেটা) — আজকের জন্য ম্যানুয়ালি যাচাই করা';
+    }
   } catch (e) {
     banner.className = 'banner error';
     banner.innerHTML = '⚠️ সার্ভারের সাথে সংযোগ করা যায়নি। একটু পর আবার চেষ্টা করুন। <button class="retry" onclick="loadAll()">আবার চেষ্টা করুন</button>';
@@ -814,6 +963,73 @@ async function loadPortfolio() {
     `;
   } catch (e) {
     result.innerHTML = '<div class="empty">ডেটা লোড করা যায়নি।</div>';
+  }
+}
+
+/* ---------------- ADMIN (Manual Data Entry) ---------------- */
+function parseMoverLines(text) {
+  return text.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+    const parts = line.split(',').map(p => p.trim());
+    return {
+      trading_code: parts[0] || '',
+      company_name: parts[1] || parts[0] || '',
+      ltp: parseFloat(parts[2]) || 0,
+      change_percent: parseFloat(parts[3]) || 0,
+      volume: parseInt(parts[4], 10) || 0,
+    };
+  }).filter(r => r.trading_code);
+}
+
+async function submitManualEntry() {
+  const key = document.getElementById('adminKey').value;
+  const msg = document.getElementById('adminMsg');
+  if (!key) { msg.innerHTML = '<span class="down">Admin Key দিন</span>'; return; }
+
+  const close = parseFloat(document.getElementById('admClose').value);
+  const change = parseFloat(document.getElementById('admChange').value);
+  const changePct = parseFloat(document.getElementById('admChangePct').value);
+  const volume = parseInt(document.getElementById('admVolume').value, 10) || 0;
+  const turnover = parseFloat(document.getElementById('admTurnover').value) || 0;
+
+  const body = {};
+  if (!isNaN(close) && !isNaN(change) && !isNaN(changePct)) {
+    body.index = { close_value: close, change_value: change, change_percent: changePct, total_volume: volume, total_turnover: turnover };
+  }
+  const gainers = parseMoverLines(document.getElementById('admGainers').value);
+  const losers = parseMoverLines(document.getElementById('admLosers').value);
+  if (gainers.length) body.gainers = gainers;
+  if (losers.length) body.losers = losers;
+
+  if (!body.index && !body.gainers && !body.losers) {
+    msg.innerHTML = '<span class="down">অন্তত ইনডেক্স অথবা গেইনার্স/লুজার্স পূরণ করুন</span>';
+    return;
+  }
+
+  msg.innerHTML = 'সেভ হচ্ছে...';
+  try {
+    const res = await fetch('/v1/admin/manual-entry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Key': key },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 401) { msg.innerHTML = '<span class="down">ভুল Admin Key</span>'; return; }
+    if (!res.ok) { msg.innerHTML = '<span class="down">সেভ করা যায়নি</span>'; return; }
+    msg.innerHTML = '<span class="up">✅ সেভ হয়ে গেছে — মার্কেট ট্যাবে গিয়ে রিফ্রেশ করলে যাচাইকৃত ডেটা দেখাবে</span>';
+  } catch (e) {
+    msg.innerHTML = '<span class="down">সার্ভার সংযোগে সমস্যা হয়েছে</span>';
+  }
+}
+
+async function clearManualEntry() {
+  const key = document.getElementById('adminKey').value;
+  const msg = document.getElementById('adminMsg');
+  if (!key) { msg.innerHTML = '<span class="down">Admin Key দিন</span>'; return; }
+  try {
+    const res = await fetch('/v1/admin/manual-entry/today', { method: 'DELETE', headers: { 'X-Admin-Key': key } });
+    if (res.status === 401) { msg.innerHTML = '<span class="down">ভুল Admin Key</span>'; return; }
+    msg.innerHTML = '✅ মুছে ফেলা হয়েছে, ডেমো ডেটায় ফিরে যাওয়া হয়েছে';
+  } catch (e) {
+    msg.innerHTML = '<span class="down">সার্ভার সংযোগে সমস্যা হয়েছে</span>';
   }
 }
 
