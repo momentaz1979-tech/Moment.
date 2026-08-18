@@ -968,7 +968,7 @@ async function loadPortfolio() {
 
 /* ---------------- ADMIN (Manual Data Entry) ---------------- */
 function parseMoverLines(text) {
-  return text.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+  return text.split('\\n').map(l => l.trim()).filter(Boolean).map(line => {
     const parts = line.split(',').map(p => p.trim());
     return {
       trading_code: parts[0] || '',
