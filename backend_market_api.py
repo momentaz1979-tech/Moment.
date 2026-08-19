@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from datetime import date, timedelta
 import random
 import os
+import json
 
 app = FastAPI(title="StockPilot BD AI — Market API", version="1.0.0")
 
@@ -31,6 +32,58 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------
+# ডাটাবেস স্তর (SQLAlchemy + PostgreSQL)
+# DATABASE_URL এনভায়রনমেন্ট ভ্যারিয়েবল না থাকলে বা সংযোগ ব্যর্থ হলে
+# স্বয়ংক্রিয়ভাবে in-memory স্টোরেজে ফিরে যায় (অ্যাপ কখনো ক্র্যাশ করবে না)
+# ---------------------------------------------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
+DB_AVAILABLE = False
+_engine = None
+
+if DATABASE_URL:
+    try:
+        from sqlalchemy import create_engine, text
+        _engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=3, max_overflow=2)
+        with _engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS manual_index (
+                    trade_date DATE PRIMARY KEY,
+                    close_value NUMERIC(12,2) NOT NULL,
+                    change_value NUMERIC(12,2) NOT NULL,
+                    change_percent NUMERIC(6,3) NOT NULL,
+                    total_volume BIGINT DEFAULT 0,
+                    total_turnover NUMERIC(20,2) DEFAULT 0,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS manual_movers (
+                    id SERIAL PRIMARY KEY,
+                    trade_date DATE NOT NULL,
+                    category VARCHAR(10) NOT NULL CHECK (category IN ('gainer','loser')),
+                    trading_code VARCHAR(20) NOT NULL,
+                    company_name VARCHAR(255),
+                    ltp NUMERIC(12,2),
+                    change_percent NUMERIC(6,3),
+                    volume BIGINT DEFAULT 0,
+                    UNIQUE(trade_date, category, trading_code)
+                );
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS portfolio_holdings (
+                    trading_code VARCHAR(20) PRIMARY KEY,
+                    quantity INTEGER NOT NULL,
+                    avg_buy_price NUMERIC(12,2) NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """))
+            conn.commit()
+        DB_AVAILABLE = True
+    except Exception as _db_err:  # noqa: BLE001 — ইচ্ছাকৃতভাবে ব্রড, যাতে DB সমস্যায় অ্যাপ ক্র্যাশ না করে
+        DB_AVAILABLE = False
+        print(f"[DB] সংযোগ ব্যর্থ, in-memory স্টোরেজে ফিরে যাওয়া হচ্ছে: {_db_err}")
 
 # ---------------------------------------------------------------
 # মক ডেটা (ডেমো/টেস্টিং-এর জন্য; বাস্তব ডেটাবেস দিয়ে প্রতিস্থাপন করুন)
@@ -91,14 +144,103 @@ VERIFIED_DISCLAIMER = {
 }
 
 # ---------------------------------------------------------------
-# Manual Data Entry স্টোর (in-memory) — তারিখ অনুযায়ী ম্যানুয়ালি
-# যাচাই করা প্রকৃত DSEX/গেইনার্স/লুজার্স ডেটা রাখা হয়
+# Manual Data Entry স্টোর — ডাটাবেস থাকলে PostgreSQL-এ স্থায়ীভাবে সেভ হয়,
+# না থাকলে in-memory ফলব্যাক (সার্ভার রিস্টার্ট হলে হারিয়ে যাবে)
 # ---------------------------------------------------------------
-_MANUAL_DATA: dict[str, dict] = {}  # date isoformat -> {"index": {...}, "gainers": [...], "losers": [...]}
+_MANUAL_DATA_FALLBACK: dict[str, dict] = {}  # শুধু DB না থাকলে ব্যবহৃত হয়
 
 
-def _today_manual():
-    return _MANUAL_DATA.get(date.today().isoformat())
+def _get_manual_index(d: date) -> dict | None:
+    if DB_AVAILABLE:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT close_value, change_value, change_percent, total_volume, total_turnover "
+                     "FROM manual_index WHERE trade_date = :d"),
+                {"d": d},
+            ).mappings().first()
+            if not row:
+                return None
+            return {
+                "close_value": float(row["close_value"]),
+                "change_value": float(row["change_value"]),
+                "change_percent": float(row["change_percent"]),
+                "total_volume": int(row["total_volume"] or 0),
+                "total_turnover": float(row["total_turnover"] or 0),
+            }
+    return _MANUAL_DATA_FALLBACK.get(d.isoformat(), {}).get("index")
+
+
+def _get_manual_movers(d: date, category: str) -> list[dict]:
+    if DB_AVAILABLE:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT trading_code, company_name, ltp, change_percent, volume "
+                     "FROM manual_movers WHERE trade_date = :d AND category = :c ORDER BY id"),
+                {"d": d, "c": category},
+            ).mappings().all()
+            return [
+                {
+                    "trading_code": r["trading_code"],
+                    "company_name": r["company_name"] or r["trading_code"],
+                    "ltp": float(r["ltp"] or 0),
+                    "change_percent": float(r["change_percent"] or 0),
+                    "volume": int(r["volume"] or 0),
+                }
+                for r in rows
+            ]
+    key = "gainers" if category == "gainer" else "losers"
+    return _MANUAL_DATA_FALLBACK.get(d.isoformat(), {}).get(key, [])
+
+
+def _save_manual_entry(d: date, index_data: dict | None, gainers: list[dict], losers: list[dict]):
+    if DB_AVAILABLE:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            if index_data:
+                conn.execute(text("""
+                    INSERT INTO manual_index (trade_date, close_value, change_value, change_percent, total_volume, total_turnover, updated_at)
+                    VALUES (:d, :close_value, :change_value, :change_percent, :total_volume, :total_turnover, NOW())
+                    ON CONFLICT (trade_date) DO UPDATE SET
+                        close_value = EXCLUDED.close_value,
+                        change_value = EXCLUDED.change_value,
+                        change_percent = EXCLUDED.change_percent,
+                        total_volume = EXCLUDED.total_volume,
+                        total_turnover = EXCLUDED.total_turnover,
+                        updated_at = NOW()
+                """), {"d": d, **index_data})
+            for category, movers in (("gainer", gainers), ("loser", losers)):
+                if not movers:
+                    continue
+                conn.execute(text("DELETE FROM manual_movers WHERE trade_date = :d AND category = :c"), {"d": d, "c": category})
+                for m in movers:
+                    conn.execute(text("""
+                        INSERT INTO manual_movers (trade_date, category, trading_code, company_name, ltp, change_percent, volume)
+                        VALUES (:d, :c, :trading_code, :company_name, :ltp, :change_percent, :volume)
+                    """), {"d": d, "c": category, **m})
+            conn.commit()
+    else:
+        key = d.isoformat()
+        existing = _MANUAL_DATA_FALLBACK.get(key, {})
+        if index_data:
+            existing["index"] = index_data
+        if gainers:
+            existing["gainers"] = gainers
+        if losers:
+            existing["losers"] = losers
+        _MANUAL_DATA_FALLBACK[key] = existing
+
+
+def _clear_manual_entry(d: date):
+    if DB_AVAILABLE:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            conn.execute(text("DELETE FROM manual_index WHERE trade_date = :d"), {"d": d})
+            conn.execute(text("DELETE FROM manual_movers WHERE trade_date = :d"), {"d": d})
+            conn.commit()
+    else:
+        _MANUAL_DATA_FALLBACK.pop(d.isoformat(), None)
 
 
 # ---------------------------------------------------------------
@@ -111,9 +253,10 @@ def get_index(index_name: str, from_date: date | None = None, to_date: date | No
         raise HTTPException(400, "অবৈধ ইনডেক্স নাম। DSEX, DS30, অথবা DSES ব্যবহার করুন।")
     today = to_date or date.today()
 
-    manual = _MANUAL_DATA.get(today.isoformat())
-    if manual and manual.get("index") and index_name == "DSEX":
-        return {**manual["index"], "index_name": "DSEX", "trade_date": today.isoformat(), **VERIFIED_DISCLAIMER}
+    if index_name == "DSEX":
+        manual = _get_manual_index(today)
+        if manual:
+            return {**manual, "index_name": "DSEX", "trade_date": today.isoformat(), **VERIFIED_DISCLAIMER}
 
     rnd = random.Random(f"{index_name}-{today.isoformat()}")
     close = round(rnd.uniform(4500, 6800), 2)
@@ -140,18 +283,18 @@ def _all_prices(d: date):
 
 @app.get("/v1/market/gainers")
 def get_gainers(target_date: date = Query(default_factory=date.today), limit: int = 20):
-    manual = _MANUAL_DATA.get(target_date.isoformat())
-    if manual and manual.get("gainers"):
-        return {"trade_date": target_date.isoformat(), "data": manual["gainers"][:limit], **VERIFIED_DISCLAIMER}
+    manual = _get_manual_movers(target_date, "gainer")
+    if manual:
+        return {"trade_date": target_date.isoformat(), "data": manual[:limit], **VERIFIED_DISCLAIMER}
     rows = sorted(_all_prices(target_date), key=lambda r: r["change_percent"], reverse=True)
     return {"trade_date": target_date.isoformat(), "data": rows[:limit], **DEMO_DISCLAIMER}
 
 
 @app.get("/v1/market/losers")
 def get_losers(target_date: date = Query(default_factory=date.today), limit: int = 20):
-    manual = _MANUAL_DATA.get(target_date.isoformat())
-    if manual and manual.get("losers"):
-        return {"trade_date": target_date.isoformat(), "data": manual["losers"][:limit], **VERIFIED_DISCLAIMER}
+    manual = _get_manual_movers(target_date, "loser")
+    if manual:
+        return {"trade_date": target_date.isoformat(), "data": manual[:limit], **VERIFIED_DISCLAIMER}
     rows = sorted(_all_prices(target_date), key=lambda r: r["change_percent"])
     return {"trade_date": target_date.isoformat(), "data": rows[:limit], **DEMO_DISCLAIMER}
 
@@ -274,14 +417,17 @@ def company_overview(trading_code: str):
     c = _company_by_code(trading_code)
     if not c:
         raise HTTPException(404, "কোম্পানির তথ্য পাওয়া যায়নি")
-    price = _seeded_price(trading_code, date.today())
+    price = _get_current_price(trading_code, date.today())
     fin = _seeded_financials(trading_code)
+    price_disclaimer = VERIFIED_DISCLAIMER if price.get("is_verified") else DEMO_DISCLAIMER
     return {
         **c,
         **price,
         "financials": fin,
         "shareholding": _seeded_shareholding(trading_code),
-        **DEMO_DISCLAIMER,
+        "price_is_verified": price.get("is_verified", False),
+        "fundamentals_disclaimer_bn": "⚠️ EPS/P-E/NAV/শেয়ারহোল্ডিং এখনো সবসময় ডেমো ডেটা — শুধুমাত্র দাম (LTP) আজকের Admin এন্ট্রি থাকলে যাচাইকৃত হতে পারে।",
+        **price_disclaimer,
     }
 
 
@@ -368,10 +514,33 @@ def remove_watchlist(trading_code: str):
 
 
 # ---------------------------------------------------------------
-# Portfolio মডিউল (in-memory demo store — DATABASE-এ সেভ হয় না)
+# বর্তমান দাম বের করার সাধারণ ফাংশন — আগে আজকের ম্যানুয়াল
+# (যাচাইকৃত) গেইনার্স/লুজার্স তালিকায় খোঁজে, না পেলে মক ডেটা দেয়
+# ---------------------------------------------------------------
+def _get_current_price(code: str, d: date) -> dict:
+    code = code.upper()
+    for category in ("gainer", "loser"):
+        for m in _get_manual_movers(d, category):
+            if m["trading_code"].upper() == code:
+                return {
+                    "trading_code": code,
+                    "ltp": m["ltp"],
+                    "change_percent": m["change_percent"],
+                    "volume": m["volume"],
+                    "change_value": round(m["ltp"] * m["change_percent"] / 100, 2),
+                    "turnover": round(m["ltp"] * m["volume"], 2),
+                    "is_verified": True,
+                }
+    price = _seeded_price(code, d)
+    price["is_verified"] = False
+    return price
+
+
+# ---------------------------------------------------------------
+# Portfolio মডিউল — ডাটাবেস থাকলে PostgreSQL-এ স্থায়ীভাবে সেভ হয়
 # ⚠️ এখানে যোগ করা হোল্ডিং সম্পূর্ণ কাল্পনিক অনুশীলনের জন্য।
 # এটি আপনার প্রকৃত ব্রোকারেজ অ্যাকাউন্টের সাথে সংযুক্ত নয়,
-# এবং এখানকার P&L প্রকৃত বাজার মূল্যের প্রতিফলন নয়।
+# এবং যতক্ষণ না দাম "is_verified: true" দেখাচ্ছে, ততক্ষণ P&L ডেমো।
 # ---------------------------------------------------------------
 class HoldingIn(BaseModel):
     trading_code: str
@@ -379,7 +548,41 @@ class HoldingIn(BaseModel):
     avg_buy_price: float
 
 
-_PORTFOLIO: dict[str, dict] = {}  # trading_code -> {quantity, avg_buy_price}
+_PORTFOLIO_FALLBACK: dict[str, dict] = {}  # শুধু DB না থাকলে ব্যবহৃত হয়
+
+
+def _portfolio_get_all() -> dict[str, dict]:
+    if DB_AVAILABLE:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            rows = conn.execute(text("SELECT trading_code, quantity, avg_buy_price FROM portfolio_holdings")).mappings().all()
+            return {r["trading_code"]: {"quantity": r["quantity"], "avg_buy_price": float(r["avg_buy_price"])} for r in rows}
+    return dict(_PORTFOLIO_FALLBACK)
+
+
+def _portfolio_upsert(code: str, quantity: int, avg_buy_price: float):
+    if DB_AVAILABLE:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO portfolio_holdings (trading_code, quantity, avg_buy_price, updated_at)
+                VALUES (:code, :quantity, :price, NOW())
+                ON CONFLICT (trading_code) DO UPDATE SET
+                    quantity = EXCLUDED.quantity, avg_buy_price = EXCLUDED.avg_buy_price, updated_at = NOW()
+            """), {"code": code, "quantity": quantity, "price": avg_buy_price})
+            conn.commit()
+    else:
+        _PORTFOLIO_FALLBACK[code] = {"quantity": quantity, "avg_buy_price": avg_buy_price}
+
+
+def _portfolio_delete(code: str):
+    if DB_AVAILABLE:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            conn.execute(text("DELETE FROM portfolio_holdings WHERE trading_code = :code"), {"code": code})
+            conn.commit()
+    else:
+        _PORTFOLIO_FALLBACK.pop(code, None)
 
 
 @app.post("/v1/portfolio/holdings")
@@ -389,14 +592,16 @@ def add_holding(holding: HoldingIn):
         raise HTTPException(404, "কোম্পানির তথ্য পাওয়া যায়নি")
     if holding.quantity <= 0 or holding.avg_buy_price <= 0:
         raise HTTPException(400, "পরিমাণ ও ক্রয়মূল্য অবশ্যই ধনাত্মক হতে হবে")
-    code = holding.trading_code.upper()
-    _PORTFOLIO[code] = {"quantity": holding.quantity, "avg_buy_price": holding.avg_buy_price}
-    return {"message_bn": "হোল্ডিং যোগ করা হয়েছে (ডেমো — শুধু অনুশীলনের জন্য)", **DEMO_DISCLAIMER}
+    _portfolio_upsert(holding.trading_code.upper(), holding.quantity, holding.avg_buy_price)
+    return {
+        "message_bn": "হোল্ডিং যোগ করা হয়েছে" + (" (স্থায়ীভাবে সেভ হলো)" if DB_AVAILABLE else " (ডেমো — শুধু অনুশীলনের জন্য)"),
+        **DEMO_DISCLAIMER,
+    }
 
 
 @app.delete("/v1/portfolio/holdings/{trading_code}")
 def remove_holding(trading_code: str):
-    _PORTFOLIO.pop(trading_code.upper(), None)
+    _portfolio_delete(trading_code.upper())
     return {"message_bn": "হোল্ডিং মুছে ফেলা হয়েছে", **DEMO_DISCLAIMER}
 
 
@@ -405,8 +610,9 @@ def portfolio_summary():
     rows = []
     total_invested = 0.0
     total_current = 0.0
-    for code, h in _PORTFOLIO.items():
-        price = _seeded_price(code, date.today())
+    any_verified = False
+    for code, h in _portfolio_get_all().items():
+        price = _get_current_price(code, date.today())
         company = _company_by_code(code)
         invested = h["quantity"] * h["avg_buy_price"]
         current = h["quantity"] * price["ltp"]
@@ -414,12 +620,14 @@ def portfolio_summary():
         pnl_pct = (pnl / invested * 100) if invested else 0
         total_invested += invested
         total_current += current
+        any_verified = any_verified or price.get("is_verified", False)
         rows.append({
             "trading_code": code,
             "company_name": company["company_name"] if company else code,
             "quantity": h["quantity"],
             "avg_buy_price": h["avg_buy_price"],
             "ltp": price["ltp"],
+            "is_verified": price.get("is_verified", False),
             "invested_value": round(invested, 2),
             "current_value": round(current, 2),
             "pnl": round(pnl, 2),
@@ -427,13 +635,15 @@ def portfolio_summary():
         })
     total_pnl = total_current - total_invested
     total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0
+    disclaimer = VERIFIED_DISCLAIMER if (any_verified and rows and all(r["is_verified"] for r in rows)) else DEMO_DISCLAIMER
     return {
         "holdings": rows,
         "total_invested": round(total_invested, 2),
         "total_current_value": round(total_current, 2),
         "total_pnl": round(total_pnl, 2),
         "total_pnl_pct": round(total_pnl_pct, 2),
-        **DEMO_DISCLAIMER,
+        "storage": "database (স্থায়ী)" if DB_AVAILABLE else "in-memory (সার্ভার রিস্টার্ট হলে হারিয়ে যাবে)",
+        **disclaimer,
     }
 
 
@@ -473,34 +683,104 @@ def _check_admin(x_admin_key: str | None):
 @app.post("/v1/admin/manual-entry")
 def submit_manual_entry(entry: ManualEntryIn, x_admin_key: str | None = Header(default=None)):
     _check_admin(x_admin_key)
-    today_key = date.today().isoformat()
-    existing = _MANUAL_DATA.get(today_key, {})
-    if entry.index:
-        existing["index"] = entry.index.model_dump()
-    if entry.gainers:
-        existing["gainers"] = [g.model_dump() for g in entry.gainers]
-    if entry.losers:
-        existing["losers"] = [l.model_dump() for l in entry.losers]
-    _MANUAL_DATA[today_key] = existing
-    return {"message_bn": f"{today_key}-এর জন্য যাচাইকৃত ডেটা সেভ করা হয়েছে", "saved": existing}
+    today = date.today()
+    index_data = entry.index.model_dump() if entry.index else None
+    gainers = [g.model_dump() for g in entry.gainers] if entry.gainers else []
+    losers = [l.model_dump() for l in entry.losers] if entry.losers else []
+    _save_manual_entry(today, index_data, gainers, losers)
+    return {
+        "message_bn": f"{today.isoformat()}-এর জন্য যাচাইকৃত ডেটা সেভ করা হয়েছে",
+        "storage": "database (স্থায়ী)" if DB_AVAILABLE else "in-memory (সার্ভার রিস্টার্ট হলে হারিয়ে যাবে)",
+    }
 
 
 @app.get("/v1/admin/manual-entry/today")
 def get_today_manual_entry(x_admin_key: str | None = Header(default=None)):
     _check_admin(x_admin_key)
-    return _MANUAL_DATA.get(date.today().isoformat(), {"index": None, "gainers": [], "losers": []})
+    today = date.today()
+    return {
+        "index": _get_manual_index(today),
+        "gainers": _get_manual_movers(today, "gainer"),
+        "losers": _get_manual_movers(today, "loser"),
+        "storage": "database" if DB_AVAILABLE else "in-memory",
+    }
 
 
 @app.delete("/v1/admin/manual-entry/today")
 def clear_today_manual_entry(x_admin_key: str | None = Header(default=None)):
     _check_admin(x_admin_key)
-    _MANUAL_DATA.pop(date.today().isoformat(), None)
+    _clear_manual_entry(date.today())
     return {"message_bn": "আজকের যাচাইকৃত ডেটা মুছে ফেলা হয়েছে, ডেমো ডেটায় ফিরে যাওয়া হয়েছে"}
 
 
 @app.get("/")
 def root():
-    return {"message": "StockPilot BD AI Market API চলছে। /app এ যান লাইভ ড্যাশবোর্ড দেখতে, অথবা /docs এ API বিস্তারিত দেখতে।"}
+    return {
+        "message": "StockPilot BD AI Market API চলছে। /app এ যান লাইভ ড্যাশবোর্ড দেখতে, অথবা /docs এ API বিস্তারিত দেখতে।",
+        "database": "connected" if DB_AVAILABLE else "not connected (in-memory fallback active)",
+    }
+
+
+# ---------------------------------------------------------------
+# Bookmarklet ইনস্টল পেজ — dsebd.org থেকে ডেটা তোলার সহায়ক টুল
+# ---------------------------------------------------------------
+BOOKMARKLET_URI = """javascript:%0A(function%20()%20%7B%0A%20%20%22use%20strict%22%3B%0A%0A%20%20const%20API_BASE%20%3D%20%22https%3A%2F%2Fmarket-backend-v4-production.up.railway.app%22%3B%0A%0A%20%20%2F%2F%20----------%20%E0%A7%A7.%20%E0%A6%AA%E0%A7%87%E0%A6%9C%20%E0%A6%B8%E0%A7%8D%E0%A6%95%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%A8%20%E0%A6%95%E0%A6%B0%E0%A7%87%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%20%E0%A6%A1%E0%A7%87%E0%A6%9F%E0%A6%BE%20%E0%A6%96%E0%A7%8B%E0%A6%81%E0%A6%9C%E0%A6%BE%20----------%0A%20%20function%20scanPage()%20%7B%0A%20%20%20%20const%20bodyText%20%3D%20document.body.innerText%20%7C%7C%20%22%22%3B%0A%0A%20%20%20%20%2F%2F%20DSEX-%E0%A6%8F%E0%A6%B0%20%E0%A6%95%E0%A6%BE%E0%A6%9B%E0%A6%BE%E0%A6%95%E0%A6%BE%E0%A6%9B%E0%A6%BF%20%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%20%E0%A6%96%E0%A7%8B%E0%A6%81%E0%A6%9C%E0%A6%BE%20(%E0%A6%AF%E0%A7%87%E0%A6%AE%E0%A6%A8%20%22DSEX%206%2C234.12%20%2B42.35%20(0.68%25)%22)%0A%20%20%20%20let%20dsexGuess%20%3D%20null%3B%0A%20%20%20%20const%20dsexMatch%20%3D%20bodyText.match(%2FDSEX%5B%5E%5Cd%5C-%5D%7B0%2C20%7D(%5B%5Cd%2C%5D%2B%5C.%3F%5Cd*)%2Fi)%3B%0A%20%20%20%20if%20(dsexMatch)%20%7B%0A%20%20%20%20%20%20const%20changeMatch%20%3D%20bodyText%0A%20%20%20%20%20%20%20%20.slice(bodyText.indexOf(dsexMatch%5B0%5D)%2C%20bodyText.indexOf(dsexMatch%5B0%5D)%20%2B%20200)%0A%20%20%20%20%20%20%20%20.match(%2F(%5B%2B%5C-%5D%3F%5Cd%2B%5C.%3F%5Cd*)%5Cs*%5C(%3F(%5B%2B%5C-%5D%3F%5Cd%2B%5C.%3F%5Cd*)%25%3F%5C)%3F%2F)%3B%0A%20%20%20%20%20%20dsexGuess%20%3D%20%7B%0A%20%20%20%20%20%20%20%20close_value%3A%20parseFloat(dsexMatch%5B1%5D.replace(%2F%2C%2Fg%2C%20%22%22))%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20change_value%3A%20changeMatch%20%3F%20parseFloat(changeMatch%5B1%5D)%20%7C%7C%200%20%3A%200%2C%0A%20%20%20%20%20%20%20%20change_percent%3A%20changeMatch%20%3F%20parseFloat(changeMatch%5B2%5D)%20%7C%7C%200%20%3A%200%2C%0A%20%20%20%20%20%20%20%20total_volume%3A%200%2C%0A%20%20%20%20%20%20%20%20total_turnover%3A%200%2C%0A%20%20%20%20%20%20%7D%3B%0A%20%20%20%20%7D%0A%0A%20%20%20%20%2F%2F%20%E0%A6%9F%E0%A7%87%E0%A6%AC%E0%A6%BF%E0%A6%B2%E0%A7%87%E0%A6%B0%20%E0%A6%B8%E0%A6%BE%E0%A6%B0%E0%A6%BF%20%E0%A6%B8%E0%A7%8D%E0%A6%95%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%A8%20%E0%A6%95%E0%A6%B0%E0%A7%87%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%20%E0%A6%95%E0%A7%8B%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A8%E0%A6%BF-%E0%A6%95%E0%A7%8B%E0%A6%A1%20%2B%20%E0%A6%A6%E0%A6%BE%E0%A6%AE%20%2B%20%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%20%25%20%E0%A6%96%E0%A7%8B%E0%A6%81%E0%A6%9C%E0%A6%BE%0A%20%20%20%20const%20candidates%20%3D%20%5B%5D%3B%0A%20%20%20%20document.querySelectorAll(%22table%20tr%22).forEach((row)%20%3D%3E%20%7B%0A%20%20%20%20%20%20const%20cells%20%3D%20Array.from(row.querySelectorAll(%22td%2Cth%22)).map((td)%20%3D%3E%20td.innerText.trim())%3B%0A%20%20%20%20%20%20if%20(cells.length%20%3C%203)%20return%3B%0A%20%20%20%20%20%20const%20codeCell%20%3D%20cells%5B0%5D%3B%0A%20%20%20%20%20%20%2F%2F%20%E0%A6%95%E0%A7%8B%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A8%E0%A6%BF%20%E0%A6%95%E0%A7%8B%E0%A6%A1%E0%A7%87%E0%A6%B0%20%E0%A6%AE%E0%A6%A4%E0%A7%8B%3A%20%E0%A6%AC%E0%A6%A1%E0%A6%BC%20%E0%A6%B9%E0%A6%BE%E0%A6%A4%E0%A7%87%E0%A6%B0%20%E0%A6%85%E0%A6%95%E0%A7%8D%E0%A6%B7%E0%A6%B0%2F%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%2C%20%E0%A6%B8%E0%A7%8D%E0%A6%AA%E0%A7%87%E0%A6%B8%20%E0%A6%A8%E0%A7%87%E0%A6%87%2C%20%E0%A7%A8-%E0%A7%A7%E0%A7%AB%20%E0%A6%95%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%B0%E0%A7%87%E0%A6%95%E0%A7%8D%E0%A6%9F%E0%A6%BE%E0%A6%B0%0A%20%20%20%20%20%20if%20(!%2F%5E%5BA-Z0-9%5D%7B2%2C15%7D%24%2F.test(codeCell))%20return%3B%0A%20%20%20%20%20%20%2F%2F%20%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%AF%E0%A7%81%E0%A6%95%E0%A7%8D%E0%A6%A4%20%E0%A6%B8%E0%A7%87%E0%A6%B2%20%E0%A6%96%E0%A7%81%E0%A6%81%E0%A6%9C%E0%A6%BF%20(%E0%A6%A6%E0%A6%BE%E0%A6%AE%2C%20%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%20%25)%0A%20%20%20%20%20%20const%20numericCells%20%3D%20cells.slice(1).map((c)%20%3D%3E%20parseFloat(c.replace(%2F%2C%2Fg%2C%20%22%22).replace(%2F%25%2Fg%2C%20%22%22)))%3B%0A%20%20%20%20%20%20const%20validNums%20%3D%20numericCells.filter((n)%20%3D%3E%20!isNaN(n))%3B%0A%20%20%20%20%20%20if%20(validNums.length%20%3C%202)%20return%3B%0A%20%20%20%20%20%20candidates.push(%7B%0A%20%20%20%20%20%20%20%20trading_code%3A%20codeCell%2C%0A%20%20%20%20%20%20%20%20company_name%3A%20codeCell%2C%0A%20%20%20%20%20%20%20%20ltp%3A%20validNums%5B0%5D%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20change_percent%3A%20validNums.find((n)%20%3D%3E%20Math.abs(n)%20%3C%2020%20%26%26%20n%20!%3D%3D%20validNums%5B0%5D)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20volume%3A%20Math.round(validNums.find((n)%20%3D%3E%20n%20%3E%201000)%20%7C%7C%200)%2C%0A%20%20%20%20%20%20%7D)%3B%0A%20%20%20%20%7D)%3B%0A%0A%20%20%20%20return%20%7B%20dsexGuess%2C%20candidates%3A%20candidates.slice(0%2C%2040)%20%7D%3B%0A%20%20%7D%0A%0A%20%20%2F%2F%20----------%20%E0%A7%A8.%20%E0%A6%B0%E0%A6%BF%E0%A6%AD%E0%A6%BF%E0%A6%89%20%E0%A6%AA%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%A8%E0%A7%87%E0%A6%B2%20UI%20%E0%A6%A4%E0%A7%88%E0%A6%B0%E0%A6%BF%20%E0%A6%95%E0%A6%B0%E0%A6%BE%20----------%0A%20%20function%20buildPanel(scanResult)%20%7B%0A%20%20%20%20const%20old%20%3D%20document.getElementById(%22sp-bd-panel%22)%3B%0A%20%20%20%20if%20(old)%20old.remove()%3B%0A%0A%20%20%20%20const%20panel%20%3D%20document.createElement(%22div%22)%3B%0A%20%20%20%20panel.id%20%3D%20%22sp-bd-panel%22%3B%0A%20%20%20%20panel.style.cssText%20%3D%0A%20%20%20%20%20%20%22position%3Afixed%3Btop%3A10px%3Bright%3A10px%3Bwidth%3A380px%3Bmax-height%3A90vh%3Boverflow%3Aauto%3B%22%20%2B%0A%20%20%20%20%20%20%22background%3A%2312151A%3Bcolor%3A%23EDEFF2%3Bborder%3A1px%20solid%20%233EC98B%3Bborder-radius%3A12px%3B%22%20%2B%0A%20%20%20%20%20%20%22padding%3A16px%3Bz-index%3A999999%3Bfont-family%3Asans-serif%3Bfont-size%3A13px%3Bbox-shadow%3A0%208px%2030px%20rgba(0%2C0%2C0%2C.5)%3B%22%3B%0A%0A%20%20%20%20const%20gainers%20%3D%20%5B...scanResult.candidates%5D.sort((a%2C%20b)%20%3D%3E%20b.change_percent%20-%20a.change_percent).slice(0%2C%205)%3B%0A%20%20%20%20const%20losers%20%3D%20%5B...scanResult.candidates%5D.sort((a%2C%20b)%20%3D%3E%20a.change_percent%20-%20b.change_percent).slice(0%2C%205)%3B%0A%0A%20%20%20%20panel.innerHTML%20%3D%20%60%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A700%3Bfont-size%3A15px%3Bmargin-bottom%3A8px%3B%22%3E%F0%9F%93%8A%20StockPilot%20BD%20AI%20%E2%80%94%20%E0%A6%A1%E0%A7%87%E0%A6%9F%E0%A6%BE%20%E0%A6%AF%E0%A6%BE%E0%A6%9A%E0%A6%BE%E0%A6%87%20%E0%A6%95%E0%A6%B0%E0%A7%81%E0%A6%A8%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22color%3A%23F0A18F%3Bfont-size%3A11.5px%3Bmargin-bottom%3A12px%3B%22%3E%E2%9A%A0%EF%B8%8F%20%E0%A6%B8%E0%A7%8D%E0%A6%AC%E0%A6%AF%E0%A6%BC%E0%A6%82%E0%A6%95%E0%A7%8D%E0%A6%B0%E0%A6%BF%E0%A6%AF%E0%A6%BC%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%87%20%E0%A6%96%E0%A7%81%E0%A6%81%E0%A6%9C%E0%A7%87%20%E0%A6%AA%E0%A6%BE%E0%A6%93%E0%A6%AF%E0%A6%BC%E0%A6%BE%20%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%20%E2%80%94%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%E0%A6%B0%20%E0%A6%86%E0%A6%97%E0%A7%87%20%E0%A6%85%E0%A6%AC%E0%A6%B6%E0%A7%8D%E0%A6%AF%E0%A6%87%20dsebd.org-%E0%A6%8F%E0%A6%B0%20%E0%A6%B8%E0%A6%BE%E0%A6%A5%E0%A7%87%20%E0%A6%AE%E0%A6%BF%E0%A6%B2%E0%A6%BF%E0%A6%AF%E0%A6%BC%E0%A7%87%20%E0%A6%A6%E0%A7%87%E0%A6%96%E0%A7%81%E0%A6%A8%20%E0%A6%93%20%E0%A6%AA%E0%A7%8D%E0%A6%B0%E0%A6%AF%E0%A6%BC%E0%A7%8B%E0%A6%9C%E0%A6%A8%E0%A7%87%20%E0%A6%A0%E0%A6%BF%E0%A6%95%20%E0%A6%95%E0%A6%B0%E0%A7%81%E0%A6%A8%E0%A5%A4%3C%2Fdiv%3E%0A%0A%20%20%20%20%20%20%3Clabel%20style%3D%22display%3Ablock%3Bmargin-bottom%3A4px%3Bcolor%3A%237D8590%3B%22%3EAdmin%20Key%3C%2Flabel%3E%0A%20%20%20%20%20%20%3Cinput%20id%3D%22sp-key%22%20type%3D%22password%22%20style%3D%22width%3A100%25%3Bpadding%3A6px%3Bmargin-bottom%3A10px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%20placeholder%3D%22Admin%20Key%20%E0%A6%A6%E0%A6%BF%E0%A6%A8%22%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A600%3Bmargin-bottom%3A4px%3B%22%3EDSEX%20%E0%A6%87%E0%A6%A8%E0%A6%A1%E0%A7%87%E0%A6%95%E0%A7%8D%E0%A6%B8%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22display%3Agrid%3Bgrid-template-columns%3A1fr%201fr%3Bgap%3A6px%3Bmargin-bottom%3A10px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-close%22%20placeholder%3D%22%E0%A6%95%E0%A7%8D%E0%A6%B2%E0%A7%8B%E0%A6%9C%E0%A6%BF%E0%A6%82%22%20value%3D%22%24%7BscanResult.dsexGuess%20%3F%20scanResult.dsexGuess.close_value%20%3A%20%22%22%7D%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-change%22%20placeholder%3D%22%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%22%20value%3D%22%24%7BscanResult.dsexGuess%20%3F%20scanResult.dsexGuess.change_value%20%3A%20%22%22%7D%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-changepct%22%20placeholder%3D%22%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%20%25%22%20value%3D%22%24%7BscanResult.dsexGuess%20%3F%20scanResult.dsexGuess.change_percent%20%3A%20%22%22%7D%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-volume%22%20placeholder%3D%22%E0%A6%AD%E0%A6%B2%E0%A6%BF%E0%A6%89%E0%A6%AE%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%3C%2Fdiv%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A600%3Bmargin-bottom%3A4px%3B%22%3E%E0%A6%97%E0%A7%87%E0%A6%87%E0%A6%A8%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8%20(%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%2C%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A6%E0%A6%A8%E0%A6%BE%E0%A6%AF%E0%A7%8B%E0%A6%97%E0%A7%8D%E0%A6%AF)%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Ctextarea%20id%3D%22sp-gainers%22%20rows%3D%224%22%20style%3D%22width%3A100%25%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3Bpadding%3A6px%3Bfont-family%3Amonospace%3Bfont-size%3A11px%3Bmargin-bottom%3A10px%3B%22%3E%24%7Bgainers.map((g)%20%3D%3E%20%60%24%7Bg.trading_code%7D%2C%24%7Bg.company_name%7D%2C%24%7Bg.ltp%7D%2C%24%7Bg.change_percent%7D%2C%24%7Bg.volume%7D%60).join(%22%5Cn%22)%7D%3C%2Ftextarea%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A600%3Bmargin-bottom%3A4px%3B%22%3E%E0%A6%B2%E0%A7%81%E0%A6%9C%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8%20(%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%2C%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A6%E0%A6%A8%E0%A6%BE%E0%A6%AF%E0%A7%8B%E0%A6%97%E0%A7%8D%E0%A6%AF)%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Ctextarea%20id%3D%22sp-losers%22%20rows%3D%224%22%20style%3D%22width%3A100%25%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3Bpadding%3A6px%3Bfont-family%3Amonospace%3Bfont-size%3A11px%3Bmargin-bottom%3A10px%3B%22%3E%24%7Blosers.map((g)%20%3D%3E%20%60%24%7Bg.trading_code%7D%2C%24%7Bg.company_name%7D%2C%24%7Bg.ltp%7D%2C%24%7Bg.change_percent%7D%2C%24%7Bg.volume%7D%60).join(%22%5Cn%22)%7D%3C%2Ftextarea%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22display%3Aflex%3Bgap%3A8px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cbutton%20id%3D%22sp-send%22%20style%3D%22flex%3A1%3Bbackground%3A%233EC98B%3Bcolor%3A%230C1210%3Bborder%3Anone%3Bborder-radius%3A8px%3Bpadding%3A10px%3Bfont-weight%3A700%3Bcursor%3Apointer%3B%22%3E%E2%9C%85%20%E0%A6%AF%E0%A6%BE%E0%A6%9A%E0%A6%BE%E0%A6%87%20%E0%A6%95%E0%A6%B0%E0%A7%87%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%3C%2Fbutton%3E%0A%20%20%20%20%20%20%20%20%3Cbutton%20id%3D%22sp-close-panel%22%20style%3D%22background%3A%233A1E1E%3Bcolor%3A%23F0A18F%3Bborder%3Anone%3Bborder-radius%3A8px%3Bpadding%3A10px%3Bcursor%3Apointer%3B%22%3E%E2%9C%95%3C%2Fbutton%3E%0A%20%20%20%20%20%20%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Cdiv%20id%3D%22sp-msg%22%20style%3D%22margin-top%3A8px%3Bfont-size%3A12px%3B%22%3E%3C%2Fdiv%3E%0A%20%20%20%20%60%3B%0A%0A%20%20%20%20document.body.appendChild(panel)%3B%0A%0A%20%20%20%20document.getElementById(%22sp-close-panel%22).onclick%20%3D%20()%20%3D%3E%20panel.remove()%3B%0A%20%20%20%20document.getElementById(%22sp-send%22).onclick%20%3D%20()%20%3D%3E%20sendData(panel)%3B%0A%0A%20%20%20%20%2F%2F%20%E0%A6%86%E0%A6%97%E0%A7%87%20%E0%A6%B8%E0%A7%87%E0%A6%AD%20%E0%A6%95%E0%A6%B0%E0%A6%BE%20Admin%20Key%20%E0%A6%A5%E0%A6%BE%E0%A6%95%E0%A6%B2%E0%A7%87%20%E0%A6%AD%E0%A6%B0%E0%A7%87%20%E0%A6%A6%E0%A6%BE%E0%A6%93%20(localStorage%20%E2%80%94%20%E0%A6%8F%E0%A6%87%20%E0%A6%AC%E0%A7%8D%E0%A6%B0%E0%A6%BE%E0%A6%89%E0%A6%9C%E0%A6%BE%E0%A6%B0%E0%A7%87%E0%A6%87%20%E0%A6%A5%E0%A6%BE%E0%A6%95%E0%A7%87)%0A%20%20%20%20const%20savedKey%20%3D%20localStorage.getItem(%22sp_admin_key%22)%3B%0A%20%20%20%20if%20(savedKey)%20document.getElementById(%22sp-key%22).value%20%3D%20savedKey%3B%0A%20%20%7D%0A%0A%20%20function%20parseLines(text)%20%7B%0A%20%20%20%20return%20text%0A%20%20%20%20%20%20.split(%22%5Cn%22)%0A%20%20%20%20%20%20.map((l)%20%3D%3E%20l.trim())%0A%20%20%20%20%20%20.filter(Boolean)%0A%20%20%20%20%20%20.map((line)%20%3D%3E%20%7B%0A%20%20%20%20%20%20%20%20const%20p%20%3D%20line.split(%22%2C%22).map((x)%20%3D%3E%20x.trim())%3B%0A%20%20%20%20%20%20%20%20return%20%7B%0A%20%20%20%20%20%20%20%20%20%20trading_code%3A%20p%5B0%5D%20%7C%7C%20%22%22%2C%0A%20%20%20%20%20%20%20%20%20%20company_name%3A%20p%5B1%5D%20%7C%7C%20p%5B0%5D%20%7C%7C%20%22%22%2C%0A%20%20%20%20%20%20%20%20%20%20ltp%3A%20parseFloat(p%5B2%5D)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20%20%20change_percent%3A%20parseFloat(p%5B3%5D)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20%20%20volume%3A%20parseInt(p%5B4%5D%2C%2010)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20%7D%3B%0A%20%20%20%20%20%20%7D)%0A%20%20%20%20%20%20.filter((r)%20%3D%3E%20r.trading_code)%3B%0A%20%20%7D%0A%0A%20%20async%20function%20sendData(panel)%20%7B%0A%20%20%20%20const%20key%20%3D%20document.getElementById(%22sp-key%22).value.trim()%3B%0A%20%20%20%20const%20msg%20%3D%20document.getElementById(%22sp-msg%22)%3B%0A%20%20%20%20if%20(!key)%20%7B%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9A%A0%EF%B8%8F%20Admin%20Key%20%E0%A6%A6%E0%A6%BF%E0%A6%A8%22%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20return%3B%0A%20%20%20%20%7D%0A%20%20%20%20localStorage.setItem(%22sp_admin_key%22%2C%20key)%3B%0A%0A%20%20%20%20const%20close_value%20%3D%20parseFloat(document.getElementById(%22sp-close%22).value)%3B%0A%20%20%20%20const%20change_value%20%3D%20parseFloat(document.getElementById(%22sp-change%22).value)%3B%0A%20%20%20%20const%20change_percent%20%3D%20parseFloat(document.getElementById(%22sp-changepct%22).value)%3B%0A%20%20%20%20const%20total_volume%20%3D%20parseInt(document.getElementById(%22sp-volume%22).value%2C%2010)%20%7C%7C%200%3B%0A%0A%20%20%20%20const%20body%20%3D%20%7B%7D%3B%0A%20%20%20%20if%20(!isNaN(close_value)%20%26%26%20!isNaN(change_value)%20%26%26%20!isNaN(change_percent))%20%7B%0A%20%20%20%20%20%20body.index%20%3D%20%7B%20close_value%2C%20change_value%2C%20change_percent%2C%20total_volume%2C%20total_turnover%3A%200%20%7D%3B%0A%20%20%20%20%7D%0A%20%20%20%20const%20gainers%20%3D%20parseLines(document.getElementById(%22sp-gainers%22).value)%3B%0A%20%20%20%20const%20losers%20%3D%20parseLines(document.getElementById(%22sp-losers%22).value)%3B%0A%20%20%20%20if%20(gainers.length)%20body.gainers%20%3D%20gainers%3B%0A%20%20%20%20if%20(losers.length)%20body.losers%20%3D%20losers%3B%0A%0A%20%20%20%20if%20(!body.index%20%26%26%20!gainers.length%20%26%26%20!losers.length)%20%7B%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9A%A0%EF%B8%8F%20%E0%A6%85%E0%A6%A8%E0%A7%8D%E0%A6%A4%E0%A6%A4%20%E0%A6%8F%E0%A6%95%E0%A6%9F%E0%A6%BE%20%E0%A6%A4%E0%A6%A5%E0%A7%8D%E0%A6%AF%20(%E0%A6%87%E0%A6%A8%E0%A6%A1%E0%A7%87%E0%A6%95%E0%A7%8D%E0%A6%B8%20%E0%A6%AC%E0%A6%BE%20%E0%A6%97%E0%A7%87%E0%A6%87%E0%A6%A8%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8%2F%E0%A6%B2%E0%A7%81%E0%A6%9C%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8)%20%E0%A6%A6%E0%A6%BF%E0%A6%A8%22%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20return%3B%0A%20%20%20%20%7D%0A%0A%20%20%20%20msg.textContent%20%3D%20%22%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%20%E0%A6%B9%E0%A6%9A%E0%A7%8D%E0%A6%9B%E0%A7%87...%22%3B%0A%20%20%20%20msg.style.color%20%3D%20%22%239199A3%22%3B%0A%20%20%20%20try%20%7B%0A%20%20%20%20%20%20const%20res%20%3D%20await%20fetch(API_BASE%20%2B%20%22%2Fv1%2Fadmin%2Fmanual-entry%22%2C%20%7B%0A%20%20%20%20%20%20%20%20method%3A%20%22POST%22%2C%0A%20%20%20%20%20%20%20%20headers%3A%20%7B%20%22Content-Type%22%3A%20%22application%2Fjson%22%2C%20%22X-Admin-Key%22%3A%20key%20%7D%2C%0A%20%20%20%20%20%20%20%20body%3A%20JSON.stringify(body)%2C%0A%20%20%20%20%20%20%7D)%3B%0A%20%20%20%20%20%20if%20(res.status%20%3D%3D%3D%20401)%20%7B%0A%20%20%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9D%8C%20%E0%A6%AD%E0%A7%81%E0%A6%B2%20Admin%20Key%22%3B%0A%20%20%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20%20%20return%3B%0A%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20if%20(!res.ok)%20%7B%0A%20%20%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9D%8C%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%20%E0%A6%AF%E0%A6%BE%E0%A6%AF%E0%A6%BC%E0%A6%A8%E0%A6%BF%20(%E0%A6%B8%E0%A7%8D%E0%A6%9F%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%9F%E0%A6%BE%E0%A6%B8%20%22%20%2B%20res.status%20%2B%20%22)%22%3B%0A%20%20%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20%20%20return%3B%0A%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9C%85%20%E0%A6%B8%E0%A6%AB%E0%A6%B2%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%87%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%20%E0%A6%B9%E0%A6%AF%E0%A6%BC%E0%A7%87%E0%A6%9B%E0%A7%87!%20%E0%A6%85%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%AA%E0%A7%87%20%E0%A6%97%E0%A6%BF%E0%A6%AF%E0%A6%BC%E0%A7%87%20%E0%A6%B0%E0%A6%BF%E0%A6%AB%E0%A7%8D%E0%A6%B0%E0%A7%87%E0%A6%B6%20%E0%A6%95%E0%A6%B0%E0%A7%81%E0%A6%A8%E0%A5%A4%22%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%233EC98B%22%3B%0A%20%20%20%20%7D%20catch%20(e)%20%7B%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9D%8C%20%E0%A6%B8%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%B0%20%E0%A6%B8%E0%A6%82%E0%A6%AF%E0%A7%8B%E0%A6%97%E0%A7%87%20%E0%A6%B8%E0%A6%AE%E0%A6%B8%E0%A7%8D%E0%A6%AF%E0%A6%BE%3A%20%22%20%2B%20e.message%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%7D%0A%20%20%7D%0A%0A%20%20%2F%2F%20----------%20%E0%A6%9A%E0%A6%BE%E0%A6%B2%E0%A7%81%20%E0%A6%95%E0%A6%B0%E0%A6%BE%20----------%0A%20%20const%20result%20%3D%20scanPage()%3B%0A%20%20buildPanel(result)%3B%0A%7D)()%3B%0A"""
+
+BOOKMARKLET_PAGE = """<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StockPilot BD AI — Bookmarklet ইনস্টল</title>
+<style>
+  body { margin:0; background:#12151A; color:#EDEFF2; font-family:'Hind Siliguri','Inter',system-ui,sans-serif; padding:24px 20px 60px; }
+  .wrap { max-width:640px; margin:0 auto; }
+  h1 { font-size:22px; margin-bottom:6px; }
+  .step { background:#171B22; border:1px solid #262B33; border-radius:12px; padding:16px 18px; margin-bottom:14px; }
+  .step-num { color:#3EC98B; font-weight:700; font-size:12px; letter-spacing:.08em; }
+  .bookmarklet-btn { display:inline-block; margin:12px 0; background:#3EC98B; color:#0C1210 !important; padding:14px 22px; border-radius:10px; font-weight:700; text-decoration:none; font-size:15px; }
+  code { background:#1C2028; padding:2px 6px; border-radius:4px; font-size:12.5px; }
+  .warn { background:#3A1E1E; color:#F0A18F; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📌 StockPilot BD AI — dsebd.org ডেটা এক্সট্র্যাক্টর</h1>
+  <div class="warn">⚠️ এটা পেজ স্ক্যান করে সংখ্যা <b>অনুমান</b> করে — পাঠানোর আগে সবসময় নিজে চোখে যাচাই করুন। ভুল সংখ্যা সরাসরি অ্যাপে চলে যাবে না, আগে একটা প্রিভিউ প্যানেলে দেখাবে।</div>
+
+  <div class="step">
+    <div class="step-num">ধাপ ১</div>
+    নিচের সবুজ বাটনটা <b>বুকমার্ক বার-এ টেনে আনুন</b> (ডেক্সটপে), অথবা মোবাইলে বাটনে দীর্ঘক্ষণ চেপে ধরে "Add to bookmarks" / লিংক কপি করে ম্যানুয়ালি একটা বুকমার্ক বানান (নিচে মোবাইল নির্দেশনা দেওয়া আছে)।
+    <div><a class="bookmarklet-btn" href="javascript:%0A(function%20()%20%7B%0A%20%20%22use%20strict%22%3B%0A%0A%20%20const%20API_BASE%20%3D%20%22https%3A%2F%2Fmarket-backend-v4-production.up.railway.app%22%3B%0A%0A%20%20%2F%2F%20----------%20%E0%A7%A7.%20%E0%A6%AA%E0%A7%87%E0%A6%9C%20%E0%A6%B8%E0%A7%8D%E0%A6%95%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%A8%20%E0%A6%95%E0%A6%B0%E0%A7%87%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%20%E0%A6%A1%E0%A7%87%E0%A6%9F%E0%A6%BE%20%E0%A6%96%E0%A7%8B%E0%A6%81%E0%A6%9C%E0%A6%BE%20----------%0A%20%20function%20scanPage()%20%7B%0A%20%20%20%20const%20bodyText%20%3D%20document.body.innerText%20%7C%7C%20%22%22%3B%0A%0A%20%20%20%20%2F%2F%20DSEX-%E0%A6%8F%E0%A6%B0%20%E0%A6%95%E0%A6%BE%E0%A6%9B%E0%A6%BE%E0%A6%95%E0%A6%BE%E0%A6%9B%E0%A6%BF%20%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%20%E0%A6%96%E0%A7%8B%E0%A6%81%E0%A6%9C%E0%A6%BE%20(%E0%A6%AF%E0%A7%87%E0%A6%AE%E0%A6%A8%20%22DSEX%206%2C234.12%20%2B42.35%20(0.68%25)%22)%0A%20%20%20%20let%20dsexGuess%20%3D%20null%3B%0A%20%20%20%20const%20dsexMatch%20%3D%20bodyText.match(%2FDSEX%5B%5E%5Cd%5C-%5D%7B0%2C20%7D(%5B%5Cd%2C%5D%2B%5C.%3F%5Cd*)%2Fi)%3B%0A%20%20%20%20if%20(dsexMatch)%20%7B%0A%20%20%20%20%20%20const%20changeMatch%20%3D%20bodyText%0A%20%20%20%20%20%20%20%20.slice(bodyText.indexOf(dsexMatch%5B0%5D)%2C%20bodyText.indexOf(dsexMatch%5B0%5D)%20%2B%20200)%0A%20%20%20%20%20%20%20%20.match(%2F(%5B%2B%5C-%5D%3F%5Cd%2B%5C.%3F%5Cd*)%5Cs*%5C(%3F(%5B%2B%5C-%5D%3F%5Cd%2B%5C.%3F%5Cd*)%25%3F%5C)%3F%2F)%3B%0A%20%20%20%20%20%20dsexGuess%20%3D%20%7B%0A%20%20%20%20%20%20%20%20close_value%3A%20parseFloat(dsexMatch%5B1%5D.replace(%2F%2C%2Fg%2C%20%22%22))%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20change_value%3A%20changeMatch%20%3F%20parseFloat(changeMatch%5B1%5D)%20%7C%7C%200%20%3A%200%2C%0A%20%20%20%20%20%20%20%20change_percent%3A%20changeMatch%20%3F%20parseFloat(changeMatch%5B2%5D)%20%7C%7C%200%20%3A%200%2C%0A%20%20%20%20%20%20%20%20total_volume%3A%200%2C%0A%20%20%20%20%20%20%20%20total_turnover%3A%200%2C%0A%20%20%20%20%20%20%7D%3B%0A%20%20%20%20%7D%0A%0A%20%20%20%20%2F%2F%20%E0%A6%9F%E0%A7%87%E0%A6%AC%E0%A6%BF%E0%A6%B2%E0%A7%87%E0%A6%B0%20%E0%A6%B8%E0%A6%BE%E0%A6%B0%E0%A6%BF%20%E0%A6%B8%E0%A7%8D%E0%A6%95%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%A8%20%E0%A6%95%E0%A6%B0%E0%A7%87%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%20%E0%A6%95%E0%A7%8B%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A8%E0%A6%BF-%E0%A6%95%E0%A7%8B%E0%A6%A1%20%2B%20%E0%A6%A6%E0%A6%BE%E0%A6%AE%20%2B%20%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%20%25%20%E0%A6%96%E0%A7%8B%E0%A6%81%E0%A6%9C%E0%A6%BE%0A%20%20%20%20const%20candidates%20%3D%20%5B%5D%3B%0A%20%20%20%20document.querySelectorAll(%22table%20tr%22).forEach((row)%20%3D%3E%20%7B%0A%20%20%20%20%20%20const%20cells%20%3D%20Array.from(row.querySelectorAll(%22td%2Cth%22)).map((td)%20%3D%3E%20td.innerText.trim())%3B%0A%20%20%20%20%20%20if%20(cells.length%20%3C%203)%20return%3B%0A%20%20%20%20%20%20const%20codeCell%20%3D%20cells%5B0%5D%3B%0A%20%20%20%20%20%20%2F%2F%20%E0%A6%95%E0%A7%8B%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A8%E0%A6%BF%20%E0%A6%95%E0%A7%8B%E0%A6%A1%E0%A7%87%E0%A6%B0%20%E0%A6%AE%E0%A6%A4%E0%A7%8B%3A%20%E0%A6%AC%E0%A6%A1%E0%A6%BC%20%E0%A6%B9%E0%A6%BE%E0%A6%A4%E0%A7%87%E0%A6%B0%20%E0%A6%85%E0%A6%95%E0%A7%8D%E0%A6%B7%E0%A6%B0%2F%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%2C%20%E0%A6%B8%E0%A7%8D%E0%A6%AA%E0%A7%87%E0%A6%B8%20%E0%A6%A8%E0%A7%87%E0%A6%87%2C%20%E0%A7%A8-%E0%A7%A7%E0%A7%AB%20%E0%A6%95%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%B0%E0%A7%87%E0%A6%95%E0%A7%8D%E0%A6%9F%E0%A6%BE%E0%A6%B0%0A%20%20%20%20%20%20if%20(!%2F%5E%5BA-Z0-9%5D%7B2%2C15%7D%24%2F.test(codeCell))%20return%3B%0A%20%20%20%20%20%20%2F%2F%20%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%AF%E0%A7%81%E0%A6%95%E0%A7%8D%E0%A6%A4%20%E0%A6%B8%E0%A7%87%E0%A6%B2%20%E0%A6%96%E0%A7%81%E0%A6%81%E0%A6%9C%E0%A6%BF%20(%E0%A6%A6%E0%A6%BE%E0%A6%AE%2C%20%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%20%25)%0A%20%20%20%20%20%20const%20numericCells%20%3D%20cells.slice(1).map((c)%20%3D%3E%20parseFloat(c.replace(%2F%2C%2Fg%2C%20%22%22).replace(%2F%25%2Fg%2C%20%22%22)))%3B%0A%20%20%20%20%20%20const%20validNums%20%3D%20numericCells.filter((n)%20%3D%3E%20!isNaN(n))%3B%0A%20%20%20%20%20%20if%20(validNums.length%20%3C%202)%20return%3B%0A%20%20%20%20%20%20candidates.push(%7B%0A%20%20%20%20%20%20%20%20trading_code%3A%20codeCell%2C%0A%20%20%20%20%20%20%20%20company_name%3A%20codeCell%2C%0A%20%20%20%20%20%20%20%20ltp%3A%20validNums%5B0%5D%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20change_percent%3A%20validNums.find((n)%20%3D%3E%20Math.abs(n)%20%3C%2020%20%26%26%20n%20!%3D%3D%20validNums%5B0%5D)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20volume%3A%20Math.round(validNums.find((n)%20%3D%3E%20n%20%3E%201000)%20%7C%7C%200)%2C%0A%20%20%20%20%20%20%7D)%3B%0A%20%20%20%20%7D)%3B%0A%0A%20%20%20%20return%20%7B%20dsexGuess%2C%20candidates%3A%20candidates.slice(0%2C%2040)%20%7D%3B%0A%20%20%7D%0A%0A%20%20%2F%2F%20----------%20%E0%A7%A8.%20%E0%A6%B0%E0%A6%BF%E0%A6%AD%E0%A6%BF%E0%A6%89%20%E0%A6%AA%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%A8%E0%A7%87%E0%A6%B2%20UI%20%E0%A6%A4%E0%A7%88%E0%A6%B0%E0%A6%BF%20%E0%A6%95%E0%A6%B0%E0%A6%BE%20----------%0A%20%20function%20buildPanel(scanResult)%20%7B%0A%20%20%20%20const%20old%20%3D%20document.getElementById(%22sp-bd-panel%22)%3B%0A%20%20%20%20if%20(old)%20old.remove()%3B%0A%0A%20%20%20%20const%20panel%20%3D%20document.createElement(%22div%22)%3B%0A%20%20%20%20panel.id%20%3D%20%22sp-bd-panel%22%3B%0A%20%20%20%20panel.style.cssText%20%3D%0A%20%20%20%20%20%20%22position%3Afixed%3Btop%3A10px%3Bright%3A10px%3Bwidth%3A380px%3Bmax-height%3A90vh%3Boverflow%3Aauto%3B%22%20%2B%0A%20%20%20%20%20%20%22background%3A%2312151A%3Bcolor%3A%23EDEFF2%3Bborder%3A1px%20solid%20%233EC98B%3Bborder-radius%3A12px%3B%22%20%2B%0A%20%20%20%20%20%20%22padding%3A16px%3Bz-index%3A999999%3Bfont-family%3Asans-serif%3Bfont-size%3A13px%3Bbox-shadow%3A0%208px%2030px%20rgba(0%2C0%2C0%2C.5)%3B%22%3B%0A%0A%20%20%20%20const%20gainers%20%3D%20%5B...scanResult.candidates%5D.sort((a%2C%20b)%20%3D%3E%20b.change_percent%20-%20a.change_percent).slice(0%2C%205)%3B%0A%20%20%20%20const%20losers%20%3D%20%5B...scanResult.candidates%5D.sort((a%2C%20b)%20%3D%3E%20a.change_percent%20-%20b.change_percent).slice(0%2C%205)%3B%0A%0A%20%20%20%20panel.innerHTML%20%3D%20%60%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A700%3Bfont-size%3A15px%3Bmargin-bottom%3A8px%3B%22%3E%F0%9F%93%8A%20StockPilot%20BD%20AI%20%E2%80%94%20%E0%A6%A1%E0%A7%87%E0%A6%9F%E0%A6%BE%20%E0%A6%AF%E0%A6%BE%E0%A6%9A%E0%A6%BE%E0%A6%87%20%E0%A6%95%E0%A6%B0%E0%A7%81%E0%A6%A8%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22color%3A%23F0A18F%3Bfont-size%3A11.5px%3Bmargin-bottom%3A12px%3B%22%3E%E2%9A%A0%EF%B8%8F%20%E0%A6%B8%E0%A7%8D%E0%A6%AC%E0%A6%AF%E0%A6%BC%E0%A6%82%E0%A6%95%E0%A7%8D%E0%A6%B0%E0%A6%BF%E0%A6%AF%E0%A6%BC%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%87%20%E0%A6%96%E0%A7%81%E0%A6%81%E0%A6%9C%E0%A7%87%20%E0%A6%AA%E0%A6%BE%E0%A6%93%E0%A6%AF%E0%A6%BC%E0%A6%BE%20%E0%A6%B8%E0%A6%82%E0%A6%96%E0%A7%8D%E0%A6%AF%E0%A6%BE%20%E2%80%94%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%E0%A6%B0%20%E0%A6%86%E0%A6%97%E0%A7%87%20%E0%A6%85%E0%A6%AC%E0%A6%B6%E0%A7%8D%E0%A6%AF%E0%A6%87%20dsebd.org-%E0%A6%8F%E0%A6%B0%20%E0%A6%B8%E0%A6%BE%E0%A6%A5%E0%A7%87%20%E0%A6%AE%E0%A6%BF%E0%A6%B2%E0%A6%BF%E0%A6%AF%E0%A6%BC%E0%A7%87%20%E0%A6%A6%E0%A7%87%E0%A6%96%E0%A7%81%E0%A6%A8%20%E0%A6%93%20%E0%A6%AA%E0%A7%8D%E0%A6%B0%E0%A6%AF%E0%A6%BC%E0%A7%8B%E0%A6%9C%E0%A6%A8%E0%A7%87%20%E0%A6%A0%E0%A6%BF%E0%A6%95%20%E0%A6%95%E0%A6%B0%E0%A7%81%E0%A6%A8%E0%A5%A4%3C%2Fdiv%3E%0A%0A%20%20%20%20%20%20%3Clabel%20style%3D%22display%3Ablock%3Bmargin-bottom%3A4px%3Bcolor%3A%237D8590%3B%22%3EAdmin%20Key%3C%2Flabel%3E%0A%20%20%20%20%20%20%3Cinput%20id%3D%22sp-key%22%20type%3D%22password%22%20style%3D%22width%3A100%25%3Bpadding%3A6px%3Bmargin-bottom%3A10px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%20placeholder%3D%22Admin%20Key%20%E0%A6%A6%E0%A6%BF%E0%A6%A8%22%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A600%3Bmargin-bottom%3A4px%3B%22%3EDSEX%20%E0%A6%87%E0%A6%A8%E0%A6%A1%E0%A7%87%E0%A6%95%E0%A7%8D%E0%A6%B8%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22display%3Agrid%3Bgrid-template-columns%3A1fr%201fr%3Bgap%3A6px%3Bmargin-bottom%3A10px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-close%22%20placeholder%3D%22%E0%A6%95%E0%A7%8D%E0%A6%B2%E0%A7%8B%E0%A6%9C%E0%A6%BF%E0%A6%82%22%20value%3D%22%24%7BscanResult.dsexGuess%20%3F%20scanResult.dsexGuess.close_value%20%3A%20%22%22%7D%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-change%22%20placeholder%3D%22%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%22%20value%3D%22%24%7BscanResult.dsexGuess%20%3F%20scanResult.dsexGuess.change_value%20%3A%20%22%22%7D%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-changepct%22%20placeholder%3D%22%E0%A6%AA%E0%A6%B0%E0%A6%BF%E0%A6%AC%E0%A6%B0%E0%A7%8D%E0%A6%A4%E0%A6%A8%20%25%22%20value%3D%22%24%7BscanResult.dsexGuess%20%3F%20scanResult.dsexGuess.change_percent%20%3A%20%22%22%7D%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cinput%20id%3D%22sp-volume%22%20placeholder%3D%22%E0%A6%AD%E0%A6%B2%E0%A6%BF%E0%A6%89%E0%A6%AE%22%20style%3D%22padding%3A6px%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3B%22%3E%0A%20%20%20%20%20%20%3C%2Fdiv%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A600%3Bmargin-bottom%3A4px%3B%22%3E%E0%A6%97%E0%A7%87%E0%A6%87%E0%A6%A8%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8%20(%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%2C%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A6%E0%A6%A8%E0%A6%BE%E0%A6%AF%E0%A7%8B%E0%A6%97%E0%A7%8D%E0%A6%AF)%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Ctextarea%20id%3D%22sp-gainers%22%20rows%3D%224%22%20style%3D%22width%3A100%25%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3Bpadding%3A6px%3Bfont-family%3Amonospace%3Bfont-size%3A11px%3Bmargin-bottom%3A10px%3B%22%3E%24%7Bgainers.map((g)%20%3D%3E%20%60%24%7Bg.trading_code%7D%2C%24%7Bg.company_name%7D%2C%24%7Bg.ltp%7D%2C%24%7Bg.change_percent%7D%2C%24%7Bg.volume%7D%60).join(%22%5Cn%22)%7D%3C%2Ftextarea%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22font-weight%3A600%3Bmargin-bottom%3A4px%3B%22%3E%E0%A6%B2%E0%A7%81%E0%A6%9C%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8%20(%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%8D%E0%A6%AF%2C%20%E0%A6%B8%E0%A6%AE%E0%A7%8D%E0%A6%AA%E0%A6%BE%E0%A6%A6%E0%A6%A8%E0%A6%BE%E0%A6%AF%E0%A7%8B%E0%A6%97%E0%A7%8D%E0%A6%AF)%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Ctextarea%20id%3D%22sp-losers%22%20rows%3D%224%22%20style%3D%22width%3A100%25%3Bbackground%3A%231C2028%3Bcolor%3A%23fff%3Bborder%3A1px%20solid%20%23333%3Bborder-radius%3A6px%3Bpadding%3A6px%3Bfont-family%3Amonospace%3Bfont-size%3A11px%3Bmargin-bottom%3A10px%3B%22%3E%24%7Blosers.map((g)%20%3D%3E%20%60%24%7Bg.trading_code%7D%2C%24%7Bg.company_name%7D%2C%24%7Bg.ltp%7D%2C%24%7Bg.change_percent%7D%2C%24%7Bg.volume%7D%60).join(%22%5Cn%22)%7D%3C%2Ftextarea%3E%0A%0A%20%20%20%20%20%20%3Cdiv%20style%3D%22display%3Aflex%3Bgap%3A8px%3B%22%3E%0A%20%20%20%20%20%20%20%20%3Cbutton%20id%3D%22sp-send%22%20style%3D%22flex%3A1%3Bbackground%3A%233EC98B%3Bcolor%3A%230C1210%3Bborder%3Anone%3Bborder-radius%3A8px%3Bpadding%3A10px%3Bfont-weight%3A700%3Bcursor%3Apointer%3B%22%3E%E2%9C%85%20%E0%A6%AF%E0%A6%BE%E0%A6%9A%E0%A6%BE%E0%A6%87%20%E0%A6%95%E0%A6%B0%E0%A7%87%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%3C%2Fbutton%3E%0A%20%20%20%20%20%20%20%20%3Cbutton%20id%3D%22sp-close-panel%22%20style%3D%22background%3A%233A1E1E%3Bcolor%3A%23F0A18F%3Bborder%3Anone%3Bborder-radius%3A8px%3Bpadding%3A10px%3Bcursor%3Apointer%3B%22%3E%E2%9C%95%3C%2Fbutton%3E%0A%20%20%20%20%20%20%3C%2Fdiv%3E%0A%20%20%20%20%20%20%3Cdiv%20id%3D%22sp-msg%22%20style%3D%22margin-top%3A8px%3Bfont-size%3A12px%3B%22%3E%3C%2Fdiv%3E%0A%20%20%20%20%60%3B%0A%0A%20%20%20%20document.body.appendChild(panel)%3B%0A%0A%20%20%20%20document.getElementById(%22sp-close-panel%22).onclick%20%3D%20()%20%3D%3E%20panel.remove()%3B%0A%20%20%20%20document.getElementById(%22sp-send%22).onclick%20%3D%20()%20%3D%3E%20sendData(panel)%3B%0A%0A%20%20%20%20%2F%2F%20%E0%A6%86%E0%A6%97%E0%A7%87%20%E0%A6%B8%E0%A7%87%E0%A6%AD%20%E0%A6%95%E0%A6%B0%E0%A6%BE%20Admin%20Key%20%E0%A6%A5%E0%A6%BE%E0%A6%95%E0%A6%B2%E0%A7%87%20%E0%A6%AD%E0%A6%B0%E0%A7%87%20%E0%A6%A6%E0%A6%BE%E0%A6%93%20(localStorage%20%E2%80%94%20%E0%A6%8F%E0%A6%87%20%E0%A6%AC%E0%A7%8D%E0%A6%B0%E0%A6%BE%E0%A6%89%E0%A6%9C%E0%A6%BE%E0%A6%B0%E0%A7%87%E0%A6%87%20%E0%A6%A5%E0%A6%BE%E0%A6%95%E0%A7%87)%0A%20%20%20%20const%20savedKey%20%3D%20localStorage.getItem(%22sp_admin_key%22)%3B%0A%20%20%20%20if%20(savedKey)%20document.getElementById(%22sp-key%22).value%20%3D%20savedKey%3B%0A%20%20%7D%0A%0A%20%20function%20parseLines(text)%20%7B%0A%20%20%20%20return%20text%0A%20%20%20%20%20%20.split(%22%5Cn%22)%0A%20%20%20%20%20%20.map((l)%20%3D%3E%20l.trim())%0A%20%20%20%20%20%20.filter(Boolean)%0A%20%20%20%20%20%20.map((line)%20%3D%3E%20%7B%0A%20%20%20%20%20%20%20%20const%20p%20%3D%20line.split(%22%2C%22).map((x)%20%3D%3E%20x.trim())%3B%0A%20%20%20%20%20%20%20%20return%20%7B%0A%20%20%20%20%20%20%20%20%20%20trading_code%3A%20p%5B0%5D%20%7C%7C%20%22%22%2C%0A%20%20%20%20%20%20%20%20%20%20company_name%3A%20p%5B1%5D%20%7C%7C%20p%5B0%5D%20%7C%7C%20%22%22%2C%0A%20%20%20%20%20%20%20%20%20%20ltp%3A%20parseFloat(p%5B2%5D)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20%20%20change_percent%3A%20parseFloat(p%5B3%5D)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20%20%20volume%3A%20parseInt(p%5B4%5D%2C%2010)%20%7C%7C%200%2C%0A%20%20%20%20%20%20%20%20%7D%3B%0A%20%20%20%20%20%20%7D)%0A%20%20%20%20%20%20.filter((r)%20%3D%3E%20r.trading_code)%3B%0A%20%20%7D%0A%0A%20%20async%20function%20sendData(panel)%20%7B%0A%20%20%20%20const%20key%20%3D%20document.getElementById(%22sp-key%22).value.trim()%3B%0A%20%20%20%20const%20msg%20%3D%20document.getElementById(%22sp-msg%22)%3B%0A%20%20%20%20if%20(!key)%20%7B%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9A%A0%EF%B8%8F%20Admin%20Key%20%E0%A6%A6%E0%A6%BF%E0%A6%A8%22%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20return%3B%0A%20%20%20%20%7D%0A%20%20%20%20localStorage.setItem(%22sp_admin_key%22%2C%20key)%3B%0A%0A%20%20%20%20const%20close_value%20%3D%20parseFloat(document.getElementById(%22sp-close%22).value)%3B%0A%20%20%20%20const%20change_value%20%3D%20parseFloat(document.getElementById(%22sp-change%22).value)%3B%0A%20%20%20%20const%20change_percent%20%3D%20parseFloat(document.getElementById(%22sp-changepct%22).value)%3B%0A%20%20%20%20const%20total_volume%20%3D%20parseInt(document.getElementById(%22sp-volume%22).value%2C%2010)%20%7C%7C%200%3B%0A%0A%20%20%20%20const%20body%20%3D%20%7B%7D%3B%0A%20%20%20%20if%20(!isNaN(close_value)%20%26%26%20!isNaN(change_value)%20%26%26%20!isNaN(change_percent))%20%7B%0A%20%20%20%20%20%20body.index%20%3D%20%7B%20close_value%2C%20change_value%2C%20change_percent%2C%20total_volume%2C%20total_turnover%3A%200%20%7D%3B%0A%20%20%20%20%7D%0A%20%20%20%20const%20gainers%20%3D%20parseLines(document.getElementById(%22sp-gainers%22).value)%3B%0A%20%20%20%20const%20losers%20%3D%20parseLines(document.getElementById(%22sp-losers%22).value)%3B%0A%20%20%20%20if%20(gainers.length)%20body.gainers%20%3D%20gainers%3B%0A%20%20%20%20if%20(losers.length)%20body.losers%20%3D%20losers%3B%0A%0A%20%20%20%20if%20(!body.index%20%26%26%20!gainers.length%20%26%26%20!losers.length)%20%7B%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9A%A0%EF%B8%8F%20%E0%A6%85%E0%A6%A8%E0%A7%8D%E0%A6%A4%E0%A6%A4%20%E0%A6%8F%E0%A6%95%E0%A6%9F%E0%A6%BE%20%E0%A6%A4%E0%A6%A5%E0%A7%8D%E0%A6%AF%20(%E0%A6%87%E0%A6%A8%E0%A6%A1%E0%A7%87%E0%A6%95%E0%A7%8D%E0%A6%B8%20%E0%A6%AC%E0%A6%BE%20%E0%A6%97%E0%A7%87%E0%A6%87%E0%A6%A8%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8%2F%E0%A6%B2%E0%A7%81%E0%A6%9C%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%B8)%20%E0%A6%A6%E0%A6%BF%E0%A6%A8%22%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20return%3B%0A%20%20%20%20%7D%0A%0A%20%20%20%20msg.textContent%20%3D%20%22%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%20%E0%A6%B9%E0%A6%9A%E0%A7%8D%E0%A6%9B%E0%A7%87...%22%3B%0A%20%20%20%20msg.style.color%20%3D%20%22%239199A3%22%3B%0A%20%20%20%20try%20%7B%0A%20%20%20%20%20%20const%20res%20%3D%20await%20fetch(API_BASE%20%2B%20%22%2Fv1%2Fadmin%2Fmanual-entry%22%2C%20%7B%0A%20%20%20%20%20%20%20%20method%3A%20%22POST%22%2C%0A%20%20%20%20%20%20%20%20headers%3A%20%7B%20%22Content-Type%22%3A%20%22application%2Fjson%22%2C%20%22X-Admin-Key%22%3A%20key%20%7D%2C%0A%20%20%20%20%20%20%20%20body%3A%20JSON.stringify(body)%2C%0A%20%20%20%20%20%20%7D)%3B%0A%20%20%20%20%20%20if%20(res.status%20%3D%3D%3D%20401)%20%7B%0A%20%20%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9D%8C%20%E0%A6%AD%E0%A7%81%E0%A6%B2%20Admin%20Key%22%3B%0A%20%20%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20%20%20return%3B%0A%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20if%20(!res.ok)%20%7B%0A%20%20%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9D%8C%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%20%E0%A6%AF%E0%A6%BE%E0%A6%AF%E0%A6%BC%E0%A6%A8%E0%A6%BF%20(%E0%A6%B8%E0%A7%8D%E0%A6%9F%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%9F%E0%A6%BE%E0%A6%B8%20%22%20%2B%20res.status%20%2B%20%22)%22%3B%0A%20%20%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%20%20%20%20return%3B%0A%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9C%85%20%E0%A6%B8%E0%A6%AB%E0%A6%B2%E0%A6%AD%E0%A6%BE%E0%A6%AC%E0%A7%87%20%E0%A6%AA%E0%A6%BE%E0%A6%A0%E0%A6%BE%E0%A6%A8%E0%A7%8B%20%E0%A6%B9%E0%A6%AF%E0%A6%BC%E0%A7%87%E0%A6%9B%E0%A7%87!%20%E0%A6%85%E0%A7%8D%E0%A6%AF%E0%A6%BE%E0%A6%AA%E0%A7%87%20%E0%A6%97%E0%A6%BF%E0%A6%AF%E0%A6%BC%E0%A7%87%20%E0%A6%B0%E0%A6%BF%E0%A6%AB%E0%A7%8D%E0%A6%B0%E0%A7%87%E0%A6%B6%20%E0%A6%95%E0%A6%B0%E0%A7%81%E0%A6%A8%E0%A5%A4%22%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%233EC98B%22%3B%0A%20%20%20%20%7D%20catch%20(e)%20%7B%0A%20%20%20%20%20%20msg.textContent%20%3D%20%22%E2%9D%8C%20%E0%A6%B8%E0%A6%BE%E0%A6%B0%E0%A7%8D%E0%A6%AD%E0%A6%BE%E0%A6%B0%20%E0%A6%B8%E0%A6%82%E0%A6%AF%E0%A7%8B%E0%A6%97%E0%A7%87%20%E0%A6%B8%E0%A6%AE%E0%A6%B8%E0%A7%8D%E0%A6%AF%E0%A6%BE%3A%20%22%20%2B%20e.message%3B%0A%20%20%20%20%20%20msg.style.color%20%3D%20%22%23F0A18F%22%3B%0A%20%20%20%20%7D%0A%20%20%7D%0A%0A%20%20%2F%2F%20----------%20%E0%A6%9A%E0%A6%BE%E0%A6%B2%E0%A7%81%20%E0%A6%95%E0%A6%B0%E0%A6%BE%20----------%0A%20%20const%20result%20%3D%20scanPage()%3B%0A%20%20buildPanel(result)%3B%0A%7D)()%3B%0A">📊 StockPilot ডেটা তুলুন</a></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">ধাপ ২ (মোবাইল Chrome-এ ইনস্টল করার নিয়ম)</div>
+    ১. Chrome-এর ⋮ মেনু → <b>Bookmarks</b> → <b>Add a new bookmark</b><br>
+    ২. নাম দিন: <code>StockPilot ডেটা তুলুন</code><br>
+    ৩. URL ঘরে উপরের সবুজ বাটনের লিংকটা কপি করে বসান (বাটনে চেপে ধরে "Copy link")<br>
+    ৪. সেভ করুন
+  </div>
+
+  <div class="step">
+    <div class="step-num">ধাপ ৩ — প্রতিদিন ব্যবহার</div>
+    ১. Chrome-এ dsebd.org খুলুন (স্বাভাবিকভাবে, মানুষ হিসেবে)<br>
+    ২. ঠিকানা বারে গিয়ে বুকমার্কের নাম টাইপ করুন (<code>StockPilot ডেটা তুলুন</code>) এবং সিলেক্ট করুন — এতেই এটা চালু হয়ে যাবে<br>
+    ৩. একটা প্যানেল খুলবে, সংখ্যা যাচাই/সম্পাদনা করুন<br>
+    ৪. Admin Key দিয়ে "✅ যাচাই করে পাঠান" চাপুন
+  </div>
+
+  <div style="text-align:center; margin-top:24px;">
+    <a href="/app" style="color:#8FB8FF;">← অ্যাপে ফিরে যান</a>
+  </div>
+</div>
+</body>
+</html>"""
+
+
+@app.get("/bookmarklet", response_class=HTMLResponse)
+def bookmarklet_page():
+    return BOOKMARKLET_PAGE
 
 
 # ---------------------------------------------------------------
@@ -687,7 +967,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="footer">সংযুক্ত: এই সার্ভার (same-origin) — লাইভ ডেটা (ডেমো)।</div>
+  <div class="footer">সংযুক্ত: এই সার্ভার (same-origin) — লাইভ ডেটা (ডেমো)। <a href="/bookmarklet" style="color:#8FB8FF;">📌 dsebd.org ডেটা এক্সট্র্যাক্টর বুকমার্কলেট ইনস্টল করুন</a></div>
 </div>
 
 <script>
